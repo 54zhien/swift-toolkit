@@ -20,6 +20,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
     private(set) var continuousContentHeight: CGFloat = 0
     private(set) var continuousProgression: Double = 0
     private var isContinuousPrepared = false
+    private var continuousViewportHeight: CGFloat = 0
 
     required init(
         viewModel: EPUBNavigatorViewModel,
@@ -257,7 +258,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
                 didCompleteGoTo()
                 return
             }
-            if location.isStart {
+            if case let .locator(locator) = location,
+               let id = locator.locations.fragments.first,
+               let progression = await continuousProgressionForTagID(id) {
+                continuousProgression = progression
+                didCompleteGoTo()
+                return
+            }
+            if case .start = location {
                 continuousProgression = 0
                 didCompleteGoTo()
                 return
@@ -313,11 +321,25 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
             viewportSize.height,
             measuredHeight + contentInset.top + contentInset.bottom
         )
+        continuousViewportHeight = viewportSize.height
         updateContinuousProgression()
         isContinuousPrepared = true
         resetContinuousInnerScrollPosition()
         scrollView.isScrollEnabled = false
         return continuousProgression
+    }
+
+    private func continuousProgressionForTagID(_ id: String) async -> Double? {
+        let escapedID = id
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+        let insetTop = Double(scrollView.contentInset.top)
+        let scrollableHeight = Double(max(continuousContentHeight - continuousViewportHeight, 1))
+        let result = await evaluateScript(
+            "(() => { const element = document.getElementById('\(escapedID)'); if (!element) return null; const top = element.getBoundingClientRect().top + window.scrollY + \(insetTop); return Math.min(Math.max(top / \(scrollableHeight), 0), 1); })()"
+        )
+        guard case let .success(value) = result else { return nil }
+        return (value as? NSNumber).map { min(max($0.doubleValue, 0), 1) }
     }
 
     private func updateContinuousProgression() {

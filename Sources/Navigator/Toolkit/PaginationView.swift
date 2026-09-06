@@ -166,6 +166,7 @@ final class PaginationView: UIView, Loggable {
     private let scrollView = UIScrollView()
     private var pageHeights: [Int: CGFloat] = [:]
     private var pendingContinuousProgression: Double?
+    private var shouldApplyLoadedContinuousProgression = false
     private var isLayingOut = false
 
     /// Set while a transition animation is in progress to prevent
@@ -316,6 +317,7 @@ final class PaginationView: UIView, Loggable {
         loadingIndexQueue.removeAll()
         pageHeights.removeAll()
         pendingContinuousProgression = locationProgression(location)
+        shouldApplyLoadedContinuousProgression = true
 
         setCurrentIndex(index, location: location)
     }
@@ -412,8 +414,9 @@ final class PaginationView: UIView, Loggable {
            let view = view as? ContinuousPageView {
             let progression = await view.prepareForContinuousLayout(viewportSize: scrollView.bounds.size)
             pageHeights[index] = max(view.continuousContentHeight, scrollView.bounds.height)
-            if index == currentIndex {
+            if index == currentIndex, shouldApplyLoadedContinuousProgression {
                 pendingContinuousProgression = progression
+                shouldApplyLoadedContinuousProgression = false
             }
             setNeedsLayout()
             layoutIfNeeded()
@@ -542,6 +545,7 @@ final class PaginationView: UIView, Loggable {
 
         if layoutMode == .verticalContinuous {
             if currentIndex != index {
+                shouldApplyLoadedContinuousProgression = true
                 setCurrentIndex(index, location: location)
             } else if let view = currentView {
                 await view.go(to: location, animated: false)
@@ -553,10 +557,10 @@ final class PaginationView: UIView, Loggable {
                 return true
             }
             let progression = view.continuousProgression
-            pendingContinuousProgression = progression
+            pendingContinuousProgression = shouldAnimate ? nil : progression
             setNeedsLayout()
             layoutIfNeeded()
-            if options.animated {
+            if shouldAnimate {
                 let target = CGPoint(
                     x: 0,
                     y: yOffsetForIndex(index, viewportHeight: scrollView.bounds.height)
