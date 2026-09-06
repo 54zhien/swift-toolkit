@@ -54,6 +54,29 @@ enum EPUBViewportAndLocationCalculatorTests {
             #expect(viewport.resources.first(where: { $0.href.string == ro[1].href })?.progression == 0.0 ... 1.0)
         }
 
+        @Test("includes every visible resource in a continuous three-resource viewport")
+        func threeResourceContinuousViewport() async {
+            let ro = makeReadingOrder(count: 3)
+            let (_, viewport) = await EPUBViewportAndLocationCalculator.compute(
+                readingOrderIndices: 0 ... 2,
+                progression: { index in
+                    switch index {
+                    case 0: return 0.5 ... 1.0
+                    case 1: return 0.0 ... 1.0
+                    default: return 0.0 ... 0.25
+                    }
+                },
+                readingOrder: ro,
+                positionsByReadingOrder: makePositions(resourceCount: 3, positionsPerResource: 4),
+                tableOfContentsTitleByHref: [:],
+                fallbackLocator: noFallback
+            )
+
+            #expect(viewport.resources.map(\.href) == ro.map { $0.url() })
+            #expect(viewport.progression.lowerBound == 1.0 / 6.0)
+            #expect(viewport.progression.upperBound == 0.75)
+        }
+
         @Test("total progression range lower bound matches locator totalProgression")
         func totalProgressionLowerBoundMatchesLocator() async {
             let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(

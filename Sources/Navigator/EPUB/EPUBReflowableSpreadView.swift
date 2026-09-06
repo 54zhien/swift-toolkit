@@ -11,11 +11,15 @@ import UIKit
 import WebKit
 
 /// A view rendering a spread of resources with a reflowable layout.
-final class EPUBReflowableSpreadView: EPUBSpreadView {
+final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
+
+    private(set) var continuousContentHeight: CGFloat = 0
+    private(set) var continuousProgression: Double = 0
+    private var isContinuousPrepared = false
 
     required init(
         viewModel: EPUBNavigatorViewModel,
@@ -55,6 +59,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         scrollView.alwaysBounceHorizontal = false
 
         scrollView.isPagingEnabled = !viewModel.scroll
+        // In continuous mode the outer PaginationView owns scrolling. Keep
+        // the inner scroll enabled until the initial location is applied and
+        // the document height has been measured.
+        scrollView.isScrollEnabled = !viewModel.continuousScroll || !isContinuousPrepared
 
         webView.translatesAutoresizingMaskIntoConstraints = false
         topConstraint = webView.topAnchor.constraint(equalTo: topAnchor)
@@ -92,6 +100,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
         // Disables paginated mode if scroll is on.
         scrollView.isPagingEnabled = !viewModel.scroll
+        scrollView.isScrollEnabled = !viewModel.continuousScroll || !isContinuousPrepared
 
         updateContentInset()
     }
@@ -235,6 +244,33 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return
         }
 
+        let wasContinuousPrepared = isContinuousPrepared
+        if wasContinuousPrepared {
+            // Once the WebView has been expanded to the complete document
+            // height it no longer has an independent viewport to scroll. A
+            // progression locator can therefore be resolved directly by the
+            // outer PaginationView; this also avoids a transient inner scroll
+            // that would otherwise be lost when the frame is relaid out.
+            if case let .locator(locator) = location,
+               let progression = locator.locations.progression {
+                continuousProgression = min(max(progression, 0), 1)
+                didCompleteGoTo()
+                return
+            }
+            if location.isStart {
+                continuousProgression = 0
+                didCompleteGoTo()
+                return
+            }
+            if case .end = location {
+                continuousProgression = 1
+                didCompleteGoTo()
+                return
+            }
+
+            scrollView.isScrollEnabled = true
+        }
+
         switch location {
         case let .locator(locator):
             await go(to: locator, animated: animated)
@@ -244,7 +280,62 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             await scroll(toProgression: 1, animated: animated)
         }
 
+        if wasContinuousPrepared {
+            updateContinuousProgression()
+            resetContinuousInnerScrollPosition()
+            scrollView.isScrollEnabled = false
+        }
+
         didCompleteGoTo()
+    }
+
+    /// Measures the loaded document and converts its current inner scroll
+    /// offset into an outer-scroll progression. The web view remains a normal
+    /// viewport while loading, then the parent PaginationView expands it to
+    /// the full document height.
+    func prepareForContinuousLayout(viewportSize: CGSize) async -> Double {
+        guard viewModel.continuousScroll else {
+            return continuousProgression
+        }
+
+        let contentInset = scrollView.contentInset
+        let result = await evaluateScript(
+            "Math.max(document.scrollingElement ? document.scrollingElement.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)"
+        )
+        let measuredHeight: CGFloat = switch result {
+        case let .success(value):
+            (value as? NSNumber).map { CGFloat(truncating: $0) } ?? viewportSize.height
+        case .failure:
+            max(scrollView.contentSize.height, viewportSize.height)
+        }
+
+        continuousContentHeight = max(
+            viewportSize.height,
+            measuredHeight + contentInset.top + contentInset.bottom
+        )
+        updateContinuousProgression()
+        isContinuousPrepared = true
+        resetContinuousInnerScrollPosition()
+        scrollView.isScrollEnabled = false
+        return continuousProgression
+    }
+
+    private func updateContinuousProgression() {
+        let inset = scrollView.contentInset
+        let available = max(scrollView.contentSize.height - scrollView.bounds.height, 0)
+        guard available > 0 else {
+            continuousProgression = 0
+            return
+        }
+
+        let offset = max(scrollView.contentOffset.y + inset.top, 0)
+        continuousProgression = min(max(Double(offset / available), 0), 1)
+    }
+
+    private func resetContinuousInnerScrollPosition() {
+        var offset = scrollView.contentOffset
+        offset.y = -scrollView.contentInset.top
+        scrollView.setContentOffset(offset, animated: false)
     }
 
     private func waitGoToCompletion() async {

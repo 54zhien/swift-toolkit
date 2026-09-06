@@ -63,6 +63,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// Disables horizontal page turning when scroll is enabled.
         public var disablePageTurnsWhileScrolling: Bool
 
+        /// Enables a publication-wide vertical scroll for reflowable EPUBs
+        /// when the `scroll` preference is enabled. Fixed-layout EPUBs and
+        /// existing paginated configurations keep their current behavior.
+        public var continuousScroll: Bool
+
         /// Content insets used to add some vertical margins around reflowable
         /// EPUB publications. Note that the margins include the safe area
         /// insets. To avoid any "jump" when toggling the status bar, provide
@@ -101,6 +106,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             defaults: EPUBDefaults = EPUBDefaults(),
             editingActions: [EditingAction] = EditingAction.defaultActions,
             disablePageTurnsWhileScrolling: Bool = false,
+            continuousScroll: Bool = false,
             contentInset: [UIUserInterfaceSizeClass: EPUBContentInsets] = [
                 .compact: (top: 34, bottom: 34),
                 .regular: (top: 62, bottom: 62),
@@ -116,6 +122,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             self.defaults = defaults
             self.editingActions = editingActions
             self.disablePageTurnsWhileScrolling = disablePageTurnsWhileScrolling
+            self.continuousScroll = continuousScroll
             self.contentInset = contentInset
             self.preloadPreviousPositionCount = preloadPreviousPositionCount
             self.preloadNextPositionCount = preloadNextPositionCount
@@ -575,7 +582,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             frame: .zero,
             preloadPreviousPositionCount: hasPositions ? config.preloadPreviousPositionCount : 0,
             preloadNextPositionCount: hasPositions ? config.preloadNextPositionCount : 0,
-            isScrollEnabled: isPaginationViewScrollingEnabled
+            isScrollEnabled: isPaginationViewScrollingEnabled,
+            layoutMode: isContinuousScrollEnabled ? .verticalContinuous : .horizontal
         )
         view.delegate = self
         view.backgroundColor = .clear
@@ -588,6 +596,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         paginationView.isScrollEnabled = isPaginationViewScrollingEnabled
+        paginationView.setLayoutMode(isContinuousScrollEnabled ? .verticalContinuous : .horizontal)
         reloadSpreads()
     }
 
@@ -677,7 +686,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var isPaginationViewScrollingEnabled: Bool {
         isUserPageTurnInteractionEnabled
-            && !(config.disablePageTurnsWhileScrolling && settings.scroll)
+            && !(config.disablePageTurnsWhileScrolling && settings.scroll && !isContinuousScrollEnabled)
+    }
+
+    /// Continuous mode is deliberately opt-in and only applies to reflowable
+    /// EPUBs. Fixed-layout publications retain their existing pagination.
+    public var isContinuousScrollEnabled: Bool {
+        config.continuousScroll
+            && settings.scroll
+            && publication.metadata.epubLayout == .reflowable
     }
 
     private func updatePageTurnInteraction() {
@@ -713,6 +730,49 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
             return (nil, nil)
+        }
+
+        if isContinuousScrollEnabled {
+            let visible = paginationView?.visiblePageViews.compactMap { item -> (Int, EPUBSpreadView, CGRect)? in
+                guard
+                    let spreadView = item.view as? EPUBSpreadView,
+                    let frame = paginationView?.pageFrame(for: item.index)
+                else {
+                    return nil
+                }
+                return (item.index, spreadView, frame)
+            } ?? []
+
+            guard
+                let first = visible.first,
+                let last = visible.last,
+                let visibleContentRect = paginationView?.visibleContentRect
+            else {
+                return (nil, nil)
+            }
+
+            let firstReadingOrderIndex = first.1.spread.readingOrderIndices.lowerBound
+            let lastReadingOrderIndex = last.1.spread.readingOrderIndices.upperBound
+            let viewportHeight = visibleContentRect.height
+            let progressionByReadingOrderIndex: (Int) -> ClosedRange<Double> = { index in
+                guard let item = visible.first(where: { $0.1.spread.contains(index: index) }) else {
+                    return 0 ... 0
+                }
+
+                let denominator = max(item.2.height - viewportHeight, 1)
+                let lower = min(max((visibleContentRect.minY - item.2.minY) / denominator, 0), 1)
+                let upper = min(max((visibleContentRect.maxY - item.2.minY) / denominator, 0), 1)
+                return min(lower, upper) ... max(lower, upper)
+            }
+
+            return await EPUBViewportAndLocationCalculator.compute(
+                readingOrderIndices: firstReadingOrderIndex ... lastReadingOrderIndex,
+                progression: progressionByReadingOrderIndex,
+                readingOrder: readingOrder,
+                positionsByReadingOrder: positionsByReadingOrder,
+                tableOfContentsTitleByHref: tableOfContentsTitleByHref,
+                fallbackLocator: { [publication] in await publication.locate($0) }
+            )
         }
 
         let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
