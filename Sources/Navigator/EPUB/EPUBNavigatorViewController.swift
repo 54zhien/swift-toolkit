@@ -269,6 +269,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var adjacentPageSurface: NavigatorPageSurface?
     private var suppressLocationNotifications = false
 
+    /// Enables the navigator's built-in horizontal page-turn gestures.
+    /// Clients rendering their own interactive transitions can disable this
+    /// while retaining programmatic navigation and text interaction.
+    public var isUserPageTurnInteractionEnabled = true {
+        didSet {
+            guard oldValue != isUserPageTurnInteractionEnabled else { return }
+            updatePageTurnInteraction()
+        }
+    }
+
+    /// Resolved direction after applying publication metadata and preferences.
+    public var pageReadingProgression: ReadingProgression {
+        viewModel.readingProgression
+    }
+
     var config: Configuration {
         viewModel.config
     }
@@ -660,7 +675,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     // MARK: - Navigator
 
     private var isPaginationViewScrollingEnabled: Bool {
-        !(config.disablePageTurnsWhileScrolling && settings.scroll)
+        isUserPageTurnInteractionEnabled
+            && !(config.disablePageTurnsWhileScrolling && settings.scroll)
+    }
+
+    private func updatePageTurnInteraction() {
+        paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
+        guard !settings.scroll else { return }
+        guard let loadedViews = paginationView?.loadedViews else { return }
+        for case let spreadView as EPUBSpreadView in loadedViews.values {
+            spreadView.webView.scrollView.isScrollEnabled = isUserPageTurnInteractionEnabled
+        }
     }
 
     public var presentation: VisualNavigatorPresentation {
@@ -1061,7 +1086,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         view.backgroundColor = settings.effectiveBackgroundColor.uiColor
-        paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
+        updatePageTurnInteraction()
     }
 
     // MARK: - EPUB-specific extensions
@@ -1400,6 +1425,9 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             animatedLoad: false
         )
         spreadView.delegate = self
+        if !settings.scroll {
+            spreadView.webView.scrollView.isScrollEnabled = isUserPageTurnInteractionEnabled
+        }
 
         let userContentController = spreadView.webView.configuration.userContentController
         delegate?.navigator(self, setupUserScripts: userContentController)
