@@ -30,6 +30,7 @@ public enum NavigatorPageDirection: Hashable, Sendable {
 
     let token: UUID
     let origin: Locator
+    let generation: Int
     private(set) var isValid = true
 
     init(
@@ -37,13 +38,15 @@ public enum NavigatorPageDirection: Hashable, Sendable {
         locator: Locator,
         view: UIView,
         origin: Locator,
-        token: UUID
+        token: UUID,
+        generation: Int
     ) {
         self.direction = direction
         self.locator = locator
         self.view = view
         self.origin = origin
         self.token = token
+        self.generation = generation
         view.isUserInteractionEnabled = false
         view.accessibilityElementsHidden = true
         view.isAccessibilityElement = false
@@ -56,10 +59,25 @@ public enum NavigatorPageDirection: Hashable, Sendable {
 
 /// Provides a prepared neighboring page and a transactional, settled commit.
 ///
-/// Implementations must keep the navigator location unchanged while preparing
-/// a surface. A prepared surface is single-use: after it is committed,
-/// cancelled, or invalidated by another navigation it must not be reused.
+/// Prewarming may use an off-screen navigation transaction, but must restore
+/// the origin before it returns. Taking a prepared surface for a gesture is
+/// synchronous from the navigator's point of view: it must not navigate,
+/// layout, or snapshot. A prepared surface is single-use: after it is
+/// committed, cancelled, or invalidated by another navigation it must not be
+/// reused.
 @MainActor public protocol AdjacentPageSurfaceProviding: AnyObject {
+    /// Warms the detached previous/next surfaces while the navigator is idle.
+    ///
+    /// The operation may temporarily navigate an off-screen navigator and
+    /// restore its original locator, but it must complete before a gesture
+    /// starts. Implementations must preserve the original locator on failure
+    /// or cancellation.
+    func prewarmAdjacentPageSurfaces() async
+
+    /// Invalidates all prepared surfaces and bumps their generation.
+    /// Call this after a settings, size, theme or external navigation change.
+    func invalidateAdjacentPageSurfaces()
+
     func prepareAdjacentPage(direction: NavigatorPageDirection) async -> NavigatorPageSurface?
 
     /// Commits the prepared surface without an additional navigator animation.

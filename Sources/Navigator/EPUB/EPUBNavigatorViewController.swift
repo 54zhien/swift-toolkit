@@ -269,11 +269,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         viewModel.publication
     }
 
-    /// Token and surface for the one in-flight adjacent-page transaction.
-    /// Navigation is deliberately single-flight so a stale surface cannot
-    /// commit over a newer user action.
+    /// Prepared surfaces are generated while the navigator is settled. The
+    /// interactive transition only takes one out of this cache; it never
+    /// navigates the live WebView or captures a snapshot.
+    private var adjacentPageGeneration = 0
     private var adjacentPageToken: UUID?
     private var adjacentPageSurface: NavigatorPageSurface?
+    private var adjacentPageCache: [NavigatorPageDirection: NavigatorPageSurface] = [:]
+    private var isPrewarmingAdjacentPages = false
     private var suppressLocationNotifications = false
     private var isPerformingAdjacentPageNavigation = false
 
@@ -630,6 +633,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func _reloadSpreads() {
+        invalidateAdjacentPageSurfaces()
         let locator = currentLocation
 
         guard
@@ -795,25 +799,60 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Adjacent page surfaces
 
-    public func prepareAdjacentPage(direction: NavigatorPageDirection) async -> NavigatorPageSurface? {
-        guard adjacentPageToken == nil, state == .idle else {
-            return nil
+    public func prewarmAdjacentPageSurfaces() async {
+        guard !isPrewarmingAdjacentPages, state == .idle, adjacentPageSurface == nil else {
+            return
         }
 
         await initialized()
-        guard !Task.isCancelled else {
-            return nil
-        }
+        guard state == .idle, !Task.isCancelled else { return }
 
-        let (origin, _) = await computeCurrentLocationAndViewport()
-        guard let origin,
-              let currentSnapshot = view.snapshotView(afterScreenUpdates: true)
+        isPrewarmingAdjacentPages = true
+        defer { isPrewarmingAdjacentPages = false }
+
+        // Keep the cache useful across consecutive turns. A failed direction
+        // is simply left unavailable and will be retried after the next settle.
+        for direction in [NavigatorPageDirection.backward, .forward] {
+            if let surface = adjacentPageCache[direction], surface.isValid {
+                continue
+            }
+            if let surface = await buildAdjacentPageSurface(direction: direction) {
+                guard surface.generation == adjacentPageGeneration else {
+                    surface.invalidate()
+                    continue
+                }
+                adjacentPageCache[direction] = surface
+            }
+            guard !Task.isCancelled else { return }
+        }
+    }
+
+    public func prepareAdjacentPage(direction: NavigatorPageDirection) async -> NavigatorPageSurface? {
+        // This method is intentionally O(1) during a gesture. If the
+        // background warm-up did not finish, the caller must apply the light
+        // edge resistance and try again after the next settled state.
+        guard adjacentPageToken == nil, state == .idle,
+              let surface = adjacentPageCache.removeValue(forKey: direction),
+              surface.isValid,
+              surface.generation == adjacentPageGeneration
         else {
             return nil
         }
 
+        adjacentPageToken = surface.token
+        adjacentPageSurface = surface
+        return surface
+    }
+
+    private func buildAdjacentPageSurface(direction: NavigatorPageDirection) async -> NavigatorPageSurface? {
+        guard state == .idle, adjacentPageSurface == nil else { return nil }
+        let generation = adjacentPageGeneration
+        let (origin, _) = await computeCurrentLocationAndViewport()
+        guard let origin,
+              let currentSnapshot = view.snapshotView(afterScreenUpdates: true)
+        else { return nil }
+
         let token = UUID()
-        adjacentPageToken = token
         currentSnapshot.frame = view.bounds
         currentSnapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         currentSnapshot.isUserInteractionEnabled = false
@@ -823,58 +862,65 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         suppressLocationNotifications = true
         isPerformingAdjacentPageNavigation = true
 
-        let moved: Bool = switch direction {
+        var targetSnapshot: UIView?
+        var target: Locator?
+        var moved = false
+        var restored = false
+        defer {
+            isPerformingAdjacentPageNavigation = false
+            suppressLocationNotifications = false
+            currentSnapshot.removeFromSuperview()
+            updateCurrentLocation()
+        }
+
+        switch direction {
         case .forward:
-            await goForward(options: .none)
+            moved = await goForward(options: .none)
         case .backward:
-            await goBackward(options: .none)
+            moved = await goBackward(options: .none)
         }
 
-        let target: Locator? = moved
-            ? (await computeCurrentLocationAndViewport()).0
-            : nil
-
-        // The snapshot keeps the original page visible while the navigator
-        // loads and lays out the neighboring page. Hide it only for the
-        // synchronous snapshot call, then restore the original location
-        // before returning to the run loop.
-        currentSnapshot.isHidden = true
-        view.layoutIfNeeded()
-        let targetSnapshot = target.flatMap { _ in
-            view.snapshotView(afterScreenUpdates: true)
+        if moved {
+            target = (await computeCurrentLocationAndViewport()).0
+            // Force the target spread to settle before capturing it. The
+            // current snapshot stays on top of the live view while WebKit
+            // performs layout and resource loading.
+            currentSnapshot.isHidden = true
+            view.layoutIfNeeded()
+            targetSnapshot = view.snapshotView(afterScreenUpdates: true)
+            currentSnapshot.isHidden = false
         }
-        currentSnapshot.isHidden = false
 
-        let restored = await go(to: origin, options: .none)
+        // Always restore the origin, including cancellation and snapshot
+        // failure. This is the invariant which makes prewarming invisible.
+        restored = await go(to: origin, options: .none)
 
-        isPerformingAdjacentPageNavigation = false
-        suppressLocationNotifications = false
-        currentSnapshot.removeFromSuperview()
-        adjacentPageToken = nil
-        updateCurrentLocation()
-
-        guard
-            !Task.isCancelled,
-            moved,
-            restored,
-            let target,
-            let targetSnapshot
-        else {
+        guard !Task.isCancelled, generation == adjacentPageGeneration,
+              moved, restored, let target, let targetSnapshot else {
             return nil
         }
 
         targetSnapshot.frame = view.bounds
         targetSnapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        let surface = NavigatorPageSurface(
+        return NavigatorPageSurface(
             direction: direction,
             locator: target,
             view: targetSnapshot,
             origin: origin,
-            token: token
+            token: token,
+            generation: generation
         )
-        adjacentPageToken = token
-        adjacentPageSurface = surface
-        return surface
+    }
+
+    public func invalidateAdjacentPageSurfaces() {
+        adjacentPageGeneration &+= 1
+        adjacentPageSurface?.invalidate()
+        adjacentPageSurface = nil
+        adjacentPageToken = nil
+        for surface in adjacentPageCache.values {
+            surface.invalidate()
+        }
+        adjacentPageCache.removeAll()
     }
 
     @discardableResult
@@ -883,7 +929,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let activeSurface = adjacentPageSurface,
             activeSurface === surface,
             activeSurface.token == adjacentPageToken,
-            activeSurface.isValid
+            activeSurface.isValid,
+            activeSurface.generation == adjacentPageGeneration
         else {
             return false
         }
@@ -913,6 +960,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
 
+        // Every cached neighbor was rendered for the old origin. Once the
+        // target becomes current, retaining any of them would allow a later
+        // gesture to animate to a stale locator/snapshot.
+        for cachedSurface in adjacentPageCache.values {
+            cachedSurface.invalidate()
+        }
+        adjacentPageCache.removeAll()
         activeSurface.invalidate()
         adjacentPageSurface = nil
         adjacentPageToken = nil
@@ -957,6 +1011,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
         guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
+        if !isPerformingAdjacentPageNavigation {
+            invalidateAdjacentPageSurfaces()
+        }
         let locator = publication.normalizeLocator(locator)
 
         guard
@@ -986,6 +1043,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     @discardableResult
     public func goForward(options: NavigatorGoOptions) async -> Bool {
         guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
+        if !isPerformingAdjacentPageNavigation {
+            invalidateAdjacentPageSurfaces()
+        }
         let direction: EPUBSpreadView.Direction = {
             switch viewModel.readingProgression {
             case .ltr:
@@ -1000,6 +1060,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     @discardableResult
     public func goBackward(options: NavigatorGoOptions) async -> Bool {
         guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
+        if !isPerformingAdjacentPageNavigation {
+            invalidateAdjacentPageSurfaces()
+        }
         let direction: EPUBSpreadView.Direction = {
             switch viewModel.readingProgression {
             case .ltr:
@@ -1136,6 +1199,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
+        invalidateAdjacentPageSurfaces()
         viewModel.submitPreferences(preferences)
         applySettings()
 
