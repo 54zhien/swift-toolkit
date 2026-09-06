@@ -268,6 +268,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var adjacentPageToken: UUID?
     private var adjacentPageSurface: NavigatorPageSurface?
     private var suppressLocationNotifications = false
+    private var isPerformingAdjacentPageNavigation = false
 
     /// Enables the navigator's built-in horizontal page-turn gestures.
     /// Clients rendering their own interactive transitions can disable this
@@ -735,7 +736,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     // MARK: - Adjacent page surfaces
 
     public func prepareAdjacentPage(direction: NavigatorPageDirection) async -> NavigatorPageSurface? {
-        guard adjacentPageToken == nil else {
+        guard adjacentPageToken == nil, state == .idle else {
             return nil
         }
 
@@ -760,6 +761,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         currentSnapshot.isAccessibilityElement = false
         view.addSubview(currentSnapshot)
         suppressLocationNotifications = true
+        isPerformingAdjacentPageNavigation = true
 
         let moved: Bool = switch direction {
         case .forward:
@@ -785,6 +787,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         let restored = await go(to: origin, options: .none)
 
+        isPerformingAdjacentPageNavigation = false
         suppressLocationNotifications = false
         currentSnapshot.removeFromSuperview()
         adjacentPageToken = nil
@@ -834,10 +837,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         suppressLocationNotifications = true
+        isPerformingAdjacentPageNavigation = true
         let moved = await go(to: activeSurface.locator, options: .none)
         if Task.isCancelled, moved {
             _ = await go(to: activeSurface.origin, options: .none)
         }
+        isPerformingAdjacentPageNavigation = false
         suppressLocationNotifications = false
 
         guard moved, !Task.isCancelled else {
@@ -891,6 +896,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
+        guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
         let locator = publication.normalizeLocator(locator)
 
         guard
@@ -919,6 +925,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @discardableResult
     public func goForward(options: NavigatorGoOptions) async -> Bool {
+        guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
         let direction: EPUBSpreadView.Direction = {
             switch viewModel.readingProgression {
             case .ltr:
@@ -932,6 +939,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @discardableResult
     public func goBackward(options: NavigatorGoOptions) async -> Bool {
+        guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
         let direction: EPUBSpreadView.Direction = {
             switch viewModel.readingProgression {
             case .ltr:
