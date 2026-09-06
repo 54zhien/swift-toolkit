@@ -27,7 +27,7 @@ public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
 
 open class EPUBNavigatorViewController: InputObservableViewController,
     VisualNavigator, ViewportObservingNavigator, SelectableNavigator,
-    DecorableNavigator, Configurable, Loggable
+    DecorableNavigator, Configurable, Loggable, AdjacentPageSurfaceProviding
 {
     public enum EPUBError: Error {
         /// The provided publication is restricted. Check that any DRM was
@@ -261,6 +261,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     public var publication: Publication {
         viewModel.publication
     }
+
+    /// Token and surface for the one in-flight adjacent-page transaction.
+    /// Navigation is deliberately single-flight so a stale surface cannot
+    /// commit over a newer user action.
+    private var adjacentPageToken: UUID?
+    private var adjacentPageSurface: NavigatorPageSurface?
+    private var suppressLocationNotifications = false
 
     var config: Configuration {
         viewModel.config
@@ -700,6 +707,138 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return await spreadView.findFirstVisibleElementLocator()
     }
 
+    // MARK: - Adjacent page surfaces
+
+    public func prepareAdjacentPage(direction: NavigatorPageDirection) async -> NavigatorPageSurface? {
+        guard adjacentPageToken == nil else {
+            return nil
+        }
+
+        await initialized()
+        guard !Task.isCancelled else {
+            return nil
+        }
+
+        let (origin, _) = await computeCurrentLocationAndViewport()
+        guard let origin,
+              let currentSnapshot = view.snapshotView(afterScreenUpdates: true)
+        else {
+            return nil
+        }
+
+        let token = UUID()
+        adjacentPageToken = token
+        currentSnapshot.frame = view.bounds
+        currentSnapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        currentSnapshot.isUserInteractionEnabled = false
+        currentSnapshot.accessibilityElementsHidden = true
+        currentSnapshot.isAccessibilityElement = false
+        view.addSubview(currentSnapshot)
+        suppressLocationNotifications = true
+
+        let moved: Bool = switch direction {
+        case .forward:
+            await goForward(options: .none)
+        case .backward:
+            await goBackward(options: .none)
+        }
+
+        let target: Locator? = moved
+            ? (await computeCurrentLocationAndViewport()).0
+            : nil
+
+        // The snapshot keeps the original page visible while the navigator
+        // loads and lays out the neighboring page. Hide it only for the
+        // synchronous snapshot call, then restore the original location
+        // before returning to the run loop.
+        currentSnapshot.isHidden = true
+        view.layoutIfNeeded()
+        let targetSnapshot = target.flatMap { _ in
+            view.snapshotView(afterScreenUpdates: true)
+        }
+        currentSnapshot.isHidden = false
+
+        let restored = await go(to: origin, options: .none)
+
+        suppressLocationNotifications = false
+        currentSnapshot.removeFromSuperview()
+        adjacentPageToken = nil
+        updateCurrentLocation()
+
+        guard
+            !Task.isCancelled,
+            moved,
+            restored,
+            let target,
+            let targetSnapshot
+        else {
+            return nil
+        }
+
+        targetSnapshot.frame = view.bounds
+        targetSnapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        let surface = NavigatorPageSurface(
+            direction: direction,
+            locator: target,
+            view: targetSnapshot,
+            origin: origin,
+            token: token
+        )
+        adjacentPageToken = token
+        adjacentPageSurface = surface
+        return surface
+    }
+
+    @discardableResult
+    public func commitAdjacentPage(_ surface: NavigatorPageSurface) async -> Bool {
+        guard
+            let activeSurface = adjacentPageSurface,
+            activeSurface === surface,
+            activeSurface.token == adjacentPageToken,
+            activeSurface.isValid
+        else {
+            return false
+        }
+
+        let (location, _) = await computeCurrentLocationAndViewport()
+        guard location == activeSurface.origin else {
+            activeSurface.invalidate()
+            adjacentPageSurface = nil
+            adjacentPageToken = nil
+            return false
+        }
+
+        suppressLocationNotifications = true
+        let moved = await go(to: activeSurface.locator, options: .none)
+        if Task.isCancelled, moved {
+            _ = await go(to: activeSurface.origin, options: .none)
+        }
+        suppressLocationNotifications = false
+
+        guard moved, !Task.isCancelled else {
+            activeSurface.invalidate()
+            adjacentPageSurface = nil
+            adjacentPageToken = nil
+            updateCurrentLocation()
+            return false
+        }
+
+        activeSurface.invalidate()
+        adjacentPageSurface = nil
+        adjacentPageToken = nil
+        updateCurrentLocation()
+        return true
+    }
+
+    public func cancelAdjacentPage(_ surface: NavigatorPageSurface) {
+        guard adjacentPageSurface === surface, surface.token == adjacentPageToken else {
+            return
+        }
+        surface.invalidate()
+        adjacentPageSurface = nil
+        adjacentPageToken = nil
+    }
+
     /// Last current location notified to the delegate.
     /// Used to avoid sending twice the same location.
     private var notifiedCurrentLocation: Locator?
@@ -716,6 +855,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         (currentLocation, viewport) = await computeCurrentLocationAndViewport()
 
         if
+            !suppressLocationNotifications,
             let delegate = delegate,
             let location = currentLocation,
             location != notifiedCurrentLocation
@@ -739,7 +879,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         let success = await paginationView.goToIndex(spreadIndex, location: .locator(locator), options: options)
         on(.jumped)
-        if success {
+        if success, !suppressLocationNotifications {
             delegate?.navigator(self, didJumpTo: locator)
         }
         return success
