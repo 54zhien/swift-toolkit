@@ -936,7 +936,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         let (location, _) = await computeCurrentLocationAndViewport()
-        guard location == activeSurface.origin else {
+        guard let location, location.matchesAdjacentPageOrigin(activeSurface.origin) else {
             activeSurface.invalidate()
             adjacentPageSurface = nil
             adjacentPageToken = nil
@@ -1256,6 +1256,26 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }
         return true
+    }
+}
+
+private extension Locator {
+    /// WebKit can report tiny progression drift after restoring the same
+    /// reflowable page. Treat that as the same origin while still rejecting a
+    /// real navigation within the resource.
+    func matchesAdjacentPageOrigin(_ other: Locator) -> Bool {
+        guard href == other.href else { return false }
+        if let position = locations.position, let otherPosition = other.locations.position {
+            return position == otherPosition
+        }
+        if let progression = locations.progression,
+           let otherProgression = other.locations.progression {
+            return abs(progression - otherProgression) <= 0.002
+        }
+        if !locations.fragments.isEmpty || !other.locations.fragments.isEmpty {
+            return locations.fragments == other.locations.fragments
+        }
+        return self == other
     }
 }
 
