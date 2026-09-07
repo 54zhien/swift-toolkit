@@ -33,6 +33,39 @@ public enum NavigatorPageCommitResult: Equatable, Sendable {
     case indeterminate
 }
 
+/// Point- and pixel-accurate geometry shared by every detached page image.
+/// Consumers must reject a transition when the current and target geometry
+/// differ instead of stretching either image to fit.
+public struct NavigatorPageSurfaceGeometry: Equatable, Sendable {
+    public let pointSize: CGSize
+    public let pixelSize: CGSize
+    public let scale: CGFloat
+    public let contentRect: CGRect
+
+    public init(image: UIImage, contentRect: CGRect) {
+        pointSize = image.size
+        if let cgImage = image.cgImage {
+            pixelSize = CGSize(width: cgImage.width, height: cgImage.height)
+        } else {
+            pixelSize = CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
+        }
+        scale = image.scale
+        self.contentRect = contentRect
+    }
+}
+
+/// The visible page captured by the same WebKit snapshot path as its
+/// neighboring surfaces during prewarming.
+@MainActor public final class NavigatorCurrentPageSurface {
+    public let image: UIImage
+    public let geometry: NavigatorPageSurfaceGeometry
+
+    init(image: UIImage, contentRect: CGRect) {
+        self.image = image
+        geometry = NavigatorPageSurfaceGeometry(image: image, contentRect: contentRect)
+    }
+}
+
 /// Identity of an immutable page surface.
 public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
     public let direction: NavigatorPageDirection
@@ -66,6 +99,7 @@ public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
     public let direction: NavigatorPageDirection
     public let locator: Locator
     public let image: UIImage
+    public let geometry: NavigatorPageSurfaceGeometry
     public let identity: NavigatorPageSurfaceIdentity
     public var leafHREF: AnyURL? { identity.leafHREF }
     public var leafIndex: Int? { identity.leafIndex }
@@ -82,12 +116,14 @@ public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
         origin: Locator,
         token: UUID,
         generation: Int,
+        contentRect: CGRect,
         leafHREF: AnyURL? = nil,
         leafIndex: Int? = nil
     ) {
         self.direction = direction
         self.locator = locator
         self.image = image
+        geometry = NavigatorPageSurfaceGeometry(image: image, contentRect: contentRect)
         self.identity = NavigatorPageSurfaceIdentity(
             direction: direction,
             locator: locator,
@@ -118,6 +154,10 @@ public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
     /// The operation must leave the visible navigator at its original
     /// location, even when a direction is unavailable or fails to render.
     func prewarmAdjacentPageSurfaces() async
+
+    /// Returns the current page captured alongside the neighboring cache.
+    /// This is synchronous so gesture handling never starts WebKit work.
+    func preparedCurrentPageSurface() -> NavigatorCurrentPageSurface?
 
     /// Returns the latest cache state for a direction without starting work.
     func adjacentPageReadiness(direction: NavigatorPageDirection) -> NavigatorPageSurfaceReadiness
