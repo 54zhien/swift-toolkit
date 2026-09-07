@@ -1015,7 +1015,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         {
             preparedCurrentPageSurfaceCache = NavigatorCurrentPageSurface(
                 image: image,
-                contentRect: currentView.webView.bounds
+                contentRect: pageSurfaceContentRect(in: currentView)
             )
         } else {
             preparedCurrentPageSurfaceCache = nil
@@ -1124,7 +1124,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 origin: origin,
                 token: token,
                 generation: generation,
-                contentRect: targetView.webView.bounds,
+                contentRect: pageSurfaceContentRect(in: targetView),
                 leafHREF: target.leafHREF,
                 leafIndex: target.leafIndex
             ), readiness: .ready)
@@ -1158,7 +1158,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     origin: origin,
                     token: token,
                     generation: generation,
-                    contentRect: reflowRenderer.webView.bounds,
+                    contentRect: pageSurfaceContentRect(in: reflowRenderer),
                     leafHREF: target.leafHREF,
                     leafIndex: target.leafIndex
                 ), readiness: .ready)
@@ -1199,7 +1199,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     origin: origin,
                     token: token,
                     generation: generation,
-                    contentRect: renderer.webView.bounds,
+                    contentRect: pageSurfaceContentRect(in: renderer),
                     leafHREF: target.leafHREF,
                     leafIndex: target.leafIndex
                 ), readiness: .ready)
@@ -1424,6 +1424,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }, onCancel: {
             gate.resume(nil)
         })
+    }
+
+    private func pageSurfaceContentRect(in spreadView: EPUBSpreadView) -> CGRect {
+        spreadView.convert(spreadView.webView.bounds, from: spreadView.webView)
     }
 
     private func makeDetachedSpreadRenderer(spread: EPUBSpread, location: PageLocation) async -> EPUBSpreadView? {
