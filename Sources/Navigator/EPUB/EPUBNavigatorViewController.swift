@@ -997,11 +997,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let prewarmEpoch = adjacentPageGeneration
         defer {
             isPrewarmingAdjacentPages = false
-            guard prewarmEpoch == adjacentPageGeneration else { return }
-            for direction in [NavigatorPageDirection.backward, .forward]
-                where adjacentPageReadiness[direction] == .preparing
-            {
-                adjacentPageReadiness[direction] = .unavailable
+            if prewarmEpoch == adjacentPageGeneration {
+                for direction in [NavigatorPageDirection.backward, .forward]
+                    where adjacentPageReadiness[direction] == .preparing
+                {
+                    adjacentPageReadiness[direction] = .unavailable
+                }
             }
         }
 
@@ -1118,14 +1119,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
            let renderer = await makeDetachedSpreadRenderer(
                spread: currentView.spread,
                location: .locator(origin)
-           )
+           ),
+           let reflowRenderer = renderer as? EPUBReflowableSpreadView
         {
             defer {
                 renderer.clear()
                 renderer.superview?.removeFromSuperview()
             }
-            if let image = await renderAdjacentPage(in: renderer, direction: direction),
-               let target = await targetLocator(for: renderer, direction: direction, generation: generation),
+            if let image = await renderAdjacentPage(in: reflowRenderer, direction: direction),
+               let target = await targetLocator(for: reflowRenderer, direction: direction, generation: generation),
                generation == adjacentPageGeneration,
                !Task.isCancelled
             {
@@ -1682,7 +1684,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     ) async -> NavigatorPageCommitResult {
         // Keep rollback on the navigator's actor even when the gesture task
         // itself was cancelled; the mutation must finish before takeover.
-        let restoration = Task { @MainActor [weak self] in
+        let restoration: Task<NavigatorPageCommitResult, Never> = Task { @MainActor [weak self] in
             guard let self else { return .indeterminate }
             return await self.performAdjacentPageOriginRestore(surface, deadline: deadline)
         }
