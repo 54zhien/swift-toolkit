@@ -33,7 +33,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
             spread: spread,
             scripts: [
                 WKUserScript(source: Self.reflowableScript, injectionTime: .atDocumentStart, forMainFrameOnly: false),
-            ],
+            ] + scripts,
             animatedLoad: animatedLoad
         )
     }
@@ -107,7 +107,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
     }
 
     private func updateContentInset() {
-        let contentInset = delegate?.spreadViewContentInset(self) ?? .zero
+        let contentInset = surfaceContentInset ?? delegate?.spreadViewContentInset(self) ?? .zero
 
         if viewModel.scroll {
             topConstraint.constant = 0
@@ -481,6 +481,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
 
     /// Current progression range in the page.
     private var progression: ClosedRange<Double>?
+
+    /// The last progression reported by the page script. A zero range is a
+    /// valid position, so callers preparing a transactional surface must be
+    /// able to distinguish it from the not-yet-published state.
+    var currentProgression: ClosedRange<Double>? {
+        progression
+    }
+
     /// To check if a progression change was cancelled or not.
     private var previousProgression: ClosedRange<Double>?
 

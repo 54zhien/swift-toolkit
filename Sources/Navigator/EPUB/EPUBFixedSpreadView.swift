@@ -25,7 +25,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         animatedLoad: Bool
     ) {
         var scripts = scripts
-        scripts.append(WKUserScript(source: Self.fixedScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        scripts.insert(WKUserScript(source: Self.fixedScript, injectionTime: .atDocumentStart, forMainFrameOnly: false), at: 0)
 
         super.init(viewModel: viewModel, spread: spread, scripts: scripts, animatedLoad: animatedLoad)
     }
@@ -78,7 +78,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             return
         }
 
-        var insets = delegate?.spreadViewContentInset(self) ?? .zero
+        var insets = surfaceContentInset ?? delegate?.spreadViewContentInset(self) ?? .zero
 
         // Use the same insets on the left and right side (the largest one) to
         // keep the pages centered on the screen even if the notches are not

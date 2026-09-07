@@ -11,6 +11,135 @@ import SwiftSoup
 import UIKit
 import WebKit
 
+private final class PageSurfaceOneShot<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Never>?
+    private var finished = false
+    private var pendingValue: Value?
+    private var hasPendingValue = false
+    private var timeoutTask: Task<Void, Never>?
+
+    func install(_ continuation: CheckedContinuation<Value, Never>) {
+        var value: Value?
+        var shouldResume = false
+        var hasValue = false
+        lock.lock()
+        if finished {
+            value = pendingValue
+            shouldResume = true
+            hasValue = hasPendingValue
+        } else {
+            self.continuation = continuation
+        }
+        lock.unlock()
+        if shouldResume, hasValue {
+            continuation.resume(returning: value!)
+        }
+    }
+
+    func attachTimeout(_ task: Task<Void, Never>) {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            task.cancel()
+        } else {
+            timeoutTask = task
+            lock.unlock()
+        }
+    }
+
+    func resume(_ value: Value) {
+        var continuation: CheckedContinuation<Value, Never>?
+        var timeoutTask: Task<Void, Never>?
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        if let waiting = self.continuation {
+            continuation = waiting
+        } else {
+            pendingValue = value
+            hasPendingValue = true
+        }
+        timeoutTask = self.timeoutTask
+        lock.unlock()
+        timeoutTask?.cancel()
+        continuation?.resume(returning: value)
+    }
+}
+
+/// A native paint barrier. Unlike evaluating a JavaScript Promise, this waits
+/// for two actual display-link callbacks from the host screen before a WebKit
+/// snapshot is requested.
+@MainActor private final class TwoFramePaintBarrier {
+    private let gate = PageSurfaceOneShot<Bool>()
+    private var displayLink: CADisplayLink?
+    private var target: DisplayLinkTarget?
+    private var remainingFrames = 2
+    private var finished = false
+
+    func start(
+        _ continuation: CheckedContinuation<Bool, Never>,
+        deadline: UInt64 = DispatchTime.now().uptimeNanoseconds + 750_000_000
+    ) {
+        gate.install(continuation)
+        guard !finished else { return }
+
+        let target = DisplayLinkTarget { [weak self] in
+            self?.didDisplayFrame()
+        }
+        self.target = target
+        let displayLink = CADisplayLink(target: target, selector: #selector(DisplayLinkTarget.tick(_:)))
+        self.displayLink = displayLink
+        displayLink.add(to: .main, forMode: .common)
+
+        let timeoutTask = Task { @MainActor [weak self] in
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else {
+                self?.finish(false)
+                return
+            }
+            try? await Task.sleep(nanoseconds: deadline - now)
+            self?.finish(false)
+        }
+        gate.attachTimeout(timeoutTask)
+    }
+
+    func cancel() {
+        finish(false)
+    }
+
+    private func didDisplayFrame() {
+        remainingFrames -= 1
+        if remainingFrames <= 0 {
+            finish(true)
+        }
+    }
+
+    private func finish(_ value: Bool) {
+        guard !finished else { return }
+        finished = true
+        displayLink?.invalidate()
+        displayLink = nil
+        target = nil
+        gate.resume(value)
+    }
+
+    private final class DisplayLinkTarget: NSObject {
+        let callback: () -> Void
+
+        init(callback: @escaping () -> Void) {
+            self.callback = callback
+        }
+
+        @objc func tick(_ displayLink: CADisplayLink) {
+            callback()
+        }
+    }
+}
+
 @MainActor public protocol EPUBNavigatorDelegate: VisualNavigatorDelegate, SelectableNavigatorDelegate,
     ViewportObservingNavigatorDelegate
 {
@@ -273,9 +402,22 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// interactive transition only takes one out of this cache; it never
     /// navigates the live WebView or captures a snapshot.
     private var adjacentPageGeneration = 0
-    private var adjacentPageToken: UUID?
-    private var adjacentPageSurface: NavigatorPageSurface?
+    private enum AdjacentPageTransactionPhase: Equatable {
+        case prepared
+        case committing
+    }
+    private struct AdjacentPageTransaction {
+        let surface: NavigatorPageSurface
+        var phase: AdjacentPageTransactionPhase
+        var cancelRequested = false
+        var externalNavigationRequested = false
+    }
+    private var adjacentPageTransaction: AdjacentPageTransaction?
     private var adjacentPageCache: [NavigatorPageDirection: NavigatorPageSurface] = [:]
+    private var adjacentPageReadiness: [NavigatorPageDirection: NavigatorPageSurfaceReadiness] = [
+        .backward: .unavailable,
+        .forward: .unavailable,
+    ]
     private var isPrewarmingAdjacentPages = false
     private var suppressLocationNotifications = false
     private var isPerformingAdjacentPageNavigation = false
@@ -790,6 +932,50 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return (locator, viewport)
     }
 
+    /// Deadline-bounded observation for transition reconciliation. The
+    /// underlying locator calculation may consult the publication and cannot
+    /// be force-cancelled safely, so the late result is deliberately dropped
+    /// by the one-shot gate instead of allowing it to extend reconciliation.
+    private func computeCurrentLocationAndViewport(
+        deadline: UInt64
+    ) async -> (Locator?, NavigatorViewport?) {
+        guard deadline > DispatchTime.now().uptimeNanoseconds else {
+            return (nil, nil)
+        }
+
+        let gate = PageSurfaceOneShot<(Locator?, NavigatorViewport?)>()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<(Locator?, NavigatorViewport?), Never>) in
+                gate.install(continuation)
+                guard !Task.isCancelled else {
+                    gate.resume((nil, nil))
+                    return
+                }
+
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        gate.resume((nil, nil))
+                        return
+                    }
+                    gate.resume(await self.computeCurrentLocationAndViewport())
+                }
+
+                let timeoutTask = Task { @MainActor in
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    guard deadline > now else {
+                        gate.resume((nil, nil))
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: deadline - now)
+                    gate.resume((nil, nil))
+                }
+                gate.attachTimeout(timeoutTask)
+            }
+        }, onCancel: {
+            gate.resume((nil, nil))
+        })
+    }
+
     public func firstVisibleElementLocator() async -> Locator? {
         guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
             return nil
@@ -800,7 +986,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     // MARK: - Adjacent page surfaces
 
     public func prewarmAdjacentPageSurfaces() async {
-        guard !isPrewarmingAdjacentPages, state == .idle, adjacentPageSurface == nil else {
+        guard !isPrewarmingAdjacentPages, state == .idle, adjacentPageTransaction == nil else {
             return
         }
 
@@ -808,30 +994,52 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard state == .idle, !Task.isCancelled else { return }
 
         isPrewarmingAdjacentPages = true
-        defer { isPrewarmingAdjacentPages = false }
+        let prewarmEpoch = adjacentPageGeneration
+        defer {
+            isPrewarmingAdjacentPages = false
+            guard prewarmEpoch == adjacentPageGeneration else { return }
+            for direction in [NavigatorPageDirection.backward, .forward]
+                where adjacentPageReadiness[direction] == .preparing
+            {
+                adjacentPageReadiness[direction] = .unavailable
+            }
+        }
 
-        // Keep the cache useful across consecutive turns. A failed direction
-        // is simply left unavailable and will be retried after the next settle.
+        // Keep the cache useful across consecutive turns. This method only
+        // reads already-loaded spread views or creates a detached renderer;
+        // it never moves the visible navigator.
         for direction in [NavigatorPageDirection.backward, .forward] {
+            guard prewarmEpoch == adjacentPageGeneration, !Task.isCancelled else { return }
             if let surface = adjacentPageCache[direction], surface.isValid {
+                adjacentPageReadiness[direction] = .ready
                 continue
             }
-            if let surface = await buildAdjacentPageSurface(direction: direction) {
+            adjacentPageReadiness[direction] = .preparing
+            let result = await buildAdjacentPageSurface(direction: direction)
+            guard prewarmEpoch == adjacentPageGeneration, !Task.isCancelled else { return }
+            if let surface = result.surface {
                 guard surface.generation == adjacentPageGeneration else {
                     surface.invalidate()
+                    adjacentPageReadiness[direction] = .unavailable
                     continue
                 }
                 adjacentPageCache[direction] = surface
+                adjacentPageReadiness[direction] = .ready
+            } else {
+                adjacentPageReadiness[direction] = result.readiness
             }
-            guard !Task.isCancelled else { return }
         }
     }
 
-    public func prepareAdjacentPage(direction: NavigatorPageDirection) async -> NavigatorPageSurface? {
+    public func adjacentPageReadiness(direction: NavigatorPageDirection) -> NavigatorPageSurfaceReadiness {
+        adjacentPageReadiness[direction] ?? .unavailable
+    }
+
+    public func takePreparedAdjacentPage(direction: NavigatorPageDirection) -> NavigatorPageSurface? {
         // This method is intentionally O(1) during a gesture. If the
         // background warm-up did not finish, the caller must apply the light
         // edge resistance and try again after the next settled state.
-        guard adjacentPageToken == nil, state == .idle,
+        guard adjacentPageTransaction == nil, state == .idle,
               let surface = adjacentPageCache.removeValue(forKey: direction),
               surface.isValid,
               surface.generation == adjacentPageGeneration
@@ -839,125 +1047,554 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return nil
         }
 
-        adjacentPageToken = surface.token
-        adjacentPageSurface = surface
+        adjacentPageTransaction = AdjacentPageTransaction(surface: surface, phase: .prepared)
+        adjacentPageReadiness[direction] = .unavailable
         return surface
     }
 
-    private func buildAdjacentPageSurface(direction: NavigatorPageDirection) async -> NavigatorPageSurface? {
-        guard state == .idle, adjacentPageSurface == nil else { return nil }
+    private struct AdjacentSurfaceBuildResult {
+        let surface: NavigatorPageSurface?
+        let readiness: NavigatorPageSurfaceReadiness
+    }
+
+    private struct AdjacentSurfaceTarget {
+        let locator: Locator
+        let leafHREF: AnyURL
+        let leafIndex: Int
+    }
+
+    private func buildAdjacentPageSurface(direction: NavigatorPageDirection) async -> AdjacentSurfaceBuildResult {
+        guard state == .idle, adjacentPageTransaction == nil else {
+            return .init(surface: nil, readiness: .unavailable)
+        }
         let generation = adjacentPageGeneration
-        let (origin, _) = await computeCurrentLocationAndViewport()
-        guard let origin,
-              let currentSnapshot = view.snapshotView(afterScreenUpdates: true)
-        else { return nil }
+        guard let origin = (await computeCurrentLocationAndViewport()).0 else {
+            return .init(surface: nil, readiness: .unavailable)
+        }
 
         let token = UUID()
-        currentSnapshot.frame = view.bounds
-        currentSnapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        currentSnapshot.isUserInteractionEnabled = false
-        currentSnapshot.accessibilityElementsHidden = true
-        currentSnapshot.isAccessibilityElement = false
-        view.addSubview(currentSnapshot)
-        suppressLocationNotifications = true
-        isPerformingAdjacentPageNavigation = true
 
-        var targetSnapshot: UIView?
-        var target: Locator?
-        var moved = false
-        var restored = false
-        defer {
-            isPerformingAdjacentPageNavigation = false
-            suppressLocationNotifications = false
-            currentSnapshot.removeFromSuperview()
-            updateCurrentLocation()
+        guard let reflowHasPageInCurrentResource = await currentReflowPageAvailable(
+            direction: direction,
+            origin: origin,
+            generation: generation
+        ) else {
+            // A reflow spread with no trustworthy progression must not be
+            // treated as exhausted: doing so could incorrectly cross into the
+            // previous/next resource while the current chapter is still
+            // settling.
+            return .init(surface: nil, readiness: .failed)
         }
 
-        switch direction {
-        case .forward:
-            moved = await goForward(options: .none)
-        case .backward:
-            moved = await goBackward(options: .none)
+        // First use a spread already preloaded by PaginationView when the
+        // current resource is at its end. This is safe because it is off-screen
+        // and has no effect on currentIndex or the visible WebView.
+        if !reflowHasPageInCurrentResource,
+           let targetView = loadedAdjacentSpreadView(direction: direction),
+           targetView.isSpreadReady,
+           let image = await stableSnapshot(of: targetView),
+           let target = await targetLocator(for: targetView, direction: direction, generation: generation),
+           generation == adjacentPageGeneration,
+           !Task.isCancelled
+        {
+            return .init(surface: NavigatorPageSurface(
+                direction: direction,
+                locator: target.locator,
+                image: image,
+                origin: origin,
+                token: token,
+                generation: generation,
+                leafHREF: target.leafHREF,
+                leafIndex: target.leafIndex
+            ), readiness: .ready)
         }
 
-        if moved {
-            target = (await computeCurrentLocationAndViewport()).0
-            // Force the target spread to settle before capturing it. The
-            // current snapshot stays on top of the live view while WebKit
-            // performs layout and resource loading.
-            currentSnapshot.isHidden = true
-            view.layoutIfNeeded()
-            targetSnapshot = view.snapshotView(afterScreenUpdates: true)
-            currentSnapshot.isHidden = false
+        // Reflow pagination keeps several visual pages inside one spread.
+        // Build the neighboring page in a detached EPUBSpreadView instead of
+        // moving the visible navigator back and forth. The same mechanism also
+        // handles a preloaded-but-not-yet-loaded cross-resource spread.
+        if reflowHasPageInCurrentResource,
+           let currentView = paginationView?.currentView as? EPUBReflowableSpreadView,
+           let renderer = await makeDetachedSpreadRenderer(
+               spread: currentView.spread,
+               location: .locator(origin)
+           )
+        {
+            defer {
+                renderer.clear()
+                renderer.superview?.removeFromSuperview()
+            }
+            if let image = await renderAdjacentPage(in: renderer, direction: direction),
+               let target = await targetLocator(for: renderer, direction: direction, generation: generation),
+               generation == adjacentPageGeneration,
+               !Task.isCancelled
+            {
+                return .init(surface: NavigatorPageSurface(
+                    direction: direction,
+                    locator: target.locator,
+                    image: image,
+                    origin: origin,
+                    token: token,
+                    generation: generation,
+                    leafHREF: target.leafHREF,
+                    leafIndex: target.leafIndex
+                ), readiness: .ready)
+            }
+            return .init(surface: nil, readiness: .failed)
+        } else if reflowHasPageInCurrentResource {
+            // The current resource still has a page in this direction. Never
+            // fall through to the next chapter when its detached renderer
+            // failed; that would give the gesture the wrong target identity.
+            return .init(surface: nil, readiness: .failed)
         }
 
-        // Always restore the origin, including cancellation and snapshot
-        // failure. This is the invariant which makes prewarming invisible.
-        restored = await go(to: origin, options: .none)
+        guard let targetIndex = targetSpreadIndex(direction: direction),
+              spreads.indices.contains(targetIndex)
+        else {
+            return .init(surface: nil, readiness: .unavailable)
+        }
 
-        guard !Task.isCancelled, generation == adjacentPageGeneration,
-              moved, restored, let target, let targetSnapshot else {
+        // A missing loaded view is not a reason to touch the visible
+        // navigator. Render the target spread directly in a detached view.
+        if let renderer = await makeDetachedSpreadRenderer(
+            spread: spreads[targetIndex],
+            location: direction == .forward ? .start : .end
+        ) {
+            defer {
+                renderer.clear()
+                renderer.superview?.removeFromSuperview()
+            }
+            if let image = await stableSnapshot(of: renderer),
+               let target = await targetLocator(for: renderer, direction: direction, generation: generation),
+               generation == adjacentPageGeneration,
+               !Task.isCancelled
+            {
+                return .init(surface: NavigatorPageSurface(
+                    direction: direction,
+                    locator: target.locator,
+                    image: image,
+                    origin: origin,
+                    token: token,
+                    generation: generation,
+                    leafHREF: target.leafHREF,
+                    leafIndex: target.leafIndex
+                ), readiness: .ready)
+            }
+            return .init(surface: nil, readiness: .failed)
+        }
+
+        return .init(surface: nil, readiness: .failed)
+    }
+
+    private func targetSpreadIndex(direction: NavigatorPageDirection) -> Int? {
+        let index = currentSpreadIndex + (direction == .forward ? 1 : -1)
+        return spreads.indices.contains(index) ? index : nil
+    }
+
+    private func loadedAdjacentSpreadView(direction: NavigatorPageDirection) -> EPUBSpreadView? {
+        guard let paginationView else { return nil }
+        guard let targetIndex = targetSpreadIndex(direction: direction) else { return nil }
+        guard let targetView = paginationView.loadedViews[targetIndex] as? EPUBSpreadView else {
             return nil
         }
+        targetView.layoutIfNeeded()
+        return targetView
+    }
 
-        targetSnapshot.frame = view.bounds
-        targetSnapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        return NavigatorPageSurface(
-            direction: direction,
-            locator: target,
-            view: targetSnapshot,
-            origin: origin,
-            token: token,
-            generation: generation
+    private func currentReflowPageAvailable(
+        direction: NavigatorPageDirection,
+        origin: Locator,
+        generation: Int
+    ) async -> Bool? {
+        guard !settings.scroll else { return false }
+        guard let currentView = paginationView?.currentView else { return nil }
+        guard let reflow = currentView as? EPUBReflowableSpreadView else { return false }
+
+        for _ in 0..<90 {
+            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+
+            if reflow.isSpreadReady {
+                if let range = reflow.currentProgression {
+                    switch direction {
+                    case .forward:
+                        return range.upperBound < 0.999
+                    case .backward:
+                        return range.lowerBound > 0.001
+                    }
+                }
+
+                // The location calculated immediately before prewarming can
+                // still be useful while the WebView's progression callback is
+                // in flight. Only use it when it is an interior progression;
+                // the synthetic 0...0 returned for an unknown spread must not
+                // decide whether we cross a resource boundary.
+                if origin.href.isEquivalentTo(reflow.spread.first.link.url()),
+                   let progression = origin.locations.progression,
+                   progression > 0.001,
+                   progression < 0.999
+                {
+                    switch direction {
+                    case .forward:
+                        return progression < 0.999
+                    case .backward:
+                        return progression > 0.001
+                    }
+                }
+            }
+
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        return nil
+    }
+
+    private func targetLocator(
+        for spreadView: EPUBSpreadView,
+        direction: NavigatorPageDirection,
+        generation: Int
+    ) async -> AdjacentSurfaceTarget? {
+        // FXL pages are leaf resources. The surface still represents the
+        // complete spread in this phase, but its transaction identity must
+        // point at the actual leaf entering from the requested side.
+        if publication.metadata.layout == .fixed {
+            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+            let leaf = fixedLeaf(for: spreadView.spread, direction: direction)
+            let locator = Locator(
+                href: leaf.link.url(),
+                mediaType: leaf.link.mediaType ?? .xhtml,
+                locations: .init(progression: direction == .forward ? 0 : 1)
+            )
+            return AdjacentSurfaceTarget(
+                locator: locator,
+                leafHREF: leaf.link.url(),
+                leafIndex: leaf.index
+            )
+        }
+
+        guard let reflow = spreadView as? EPUBReflowableSpreadView,
+              let reflowProgression = await waitForPublishedProgression(
+                  in: reflow,
+                  generation: generation
+              ),
+              generation == adjacentPageGeneration,
+              !Task.isCancelled
+        else { return nil }
+
+        if let locator = await spreadView.findFirstVisibleElementLocator() {
+            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+            let locator = locator.copy(locations: { $0.progression = reflowProgression })
+            return makeSurfaceTarget(locator: locator, in: spreadView.spread)
+        }
+
+        let link = spreadView.spread.first.link
+        let locator = Locator(
+            href: link.url(),
+            mediaType: link.mediaType ?? .xhtml,
+            locations: .init(progression: reflowProgression)
         )
+        return makeSurfaceTarget(locator: locator, in: spreadView.spread)
+    }
+
+    private func waitForPublishedProgression(
+        in spreadView: EPUBReflowableSpreadView,
+        generation: Int
+    ) async -> Double? {
+        // isSpreadReady can precede the progressionChanged message by a few
+        // frames on a newly detached WebView. Wait for the real value instead
+        // of manufacturing 0, while making every exit cancellation- and
+        // generation-safe.
+        for _ in 0..<90 {
+            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+            if let progression = spreadView.currentProgression {
+                return progression.lowerBound
+            }
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        return nil
+    }
+
+    private func fixedLeaf(for spread: EPUBSpread, direction: NavigatorPageDirection) -> EPUBSpreadResource {
+        switch spread {
+        case let .single(single):
+            return single.resource
+        case let .double(double):
+            // `first` and `second` are in publication reading order. Moving
+            // forward enters the leading leaf of the target spread; moving
+            // backward enters its trailing leaf.
+            return direction == .forward ? double.first : double.second
+        }
+    }
+
+    private func makeSurfaceTarget(locator: Locator, in spread: EPUBSpread) -> AdjacentSurfaceTarget? {
+        switch spread {
+        case let .single(single):
+            return AdjacentSurfaceTarget(
+                locator: locator,
+                leafHREF: single.resource.link.url(),
+                leafIndex: single.resource.index
+            )
+        case let .double(double):
+            if double.first.link.url().isEquivalentTo(locator.href) {
+                return AdjacentSurfaceTarget(
+                    locator: locator,
+                    leafHREF: double.first.link.url(),
+                    leafIndex: double.first.index
+                )
+            }
+            if double.second.link.url().isEquivalentTo(locator.href) {
+                return AdjacentSurfaceTarget(
+                    locator: locator,
+                    leafHREF: double.second.link.url(),
+                    leafIndex: double.second.index
+                )
+            }
+            // A fixed spread fallback must still identify an actual leaf.
+            return AdjacentSurfaceTarget(
+                locator: locator,
+                leafHREF: double.first.link.url(),
+                leafIndex: double.first.index
+            )
+        }
+    }
+
+    private func snapshot(
+        of webView: WKWebView,
+        deadline: UInt64
+    ) async -> UIImage? {
+        guard webView.bounds.width > 0, webView.bounds.height > 0 else { return nil }
+        guard deadline > DispatchTime.now().uptimeNanoseconds else { return nil }
+        webView.layoutIfNeeded()
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = webView.bounds
+        // WKSnapshotConfiguration expresses snapshotWidth in points. WebKit
+        // applies the screen scale when producing the UIImage; multiplying by
+        // scale here would make the surface needlessly large and blurry when
+        // composited by Core Animation.
+        configuration.snapshotWidth = NSNumber(value: Double(webView.bounds.width))
+        let gate = PageSurfaceOneShot<UIImage?>()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
+                gate.install(continuation)
+                guard !Task.isCancelled else {
+                    gate.resume(nil)
+                    return
+                }
+
+                webView.takeSnapshot(with: configuration) { image, error in
+                    if let error {
+                        NSLog("Readium adjacent surface snapshot failed: %@", String(describing: error))
+                    }
+                    gate.resume(image)
+                }
+
+                let timeoutTask = Task { @MainActor in
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    guard deadline > now else {
+                        gate.resume(nil)
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: deadline - now)
+                    gate.resume(nil)
+                }
+                gate.attachTimeout(timeoutTask)
+            }
+        }, onCancel: {
+            gate.resume(nil)
+        })
+    }
+
+    private func makeDetachedSpreadRenderer(spread: EPUBSpread, location: PageLocation) async -> EPUBSpreadView? {
+        guard !Task.isCancelled else { return nil }
+        let host = UIView(frame: CGRect(x: -20000, y: -20000, width: view.bounds.width, height: view.bounds.height))
+        host.isUserInteractionEnabled = false
+        host.backgroundColor = .clear
+        view.addSubview(host)
+
+        let renderer = makeSpreadView(for: spread, receivesNavigatorEvents: false)
+        if let currentView = paginationView?.currentView as? EPUBSpreadView {
+            renderer.surfaceContentInset = spreadViewContentInset(currentView)
+        }
+        renderer.frame = host.bounds
+        renderer.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        host.addSubview(renderer)
+        renderer.layoutIfNeeded()
+
+        guard await waitForSpreadLoaded(renderer) else {
+            renderer.clear()
+            renderer.removeFromSuperview()
+            host.removeFromSuperview()
+            return nil
+        }
+        guard !Task.isCancelled else {
+            renderer.clear()
+            renderer.removeFromSuperview()
+            host.removeFromSuperview()
+            return nil
+        }
+        await renderer.go(to: location, animated: false)
+        guard !Task.isCancelled else {
+            renderer.clear()
+            renderer.removeFromSuperview()
+            host.removeFromSuperview()
+            return nil
+        }
+        host.accessibilityElementsHidden = true
+        return renderer
+    }
+
+    private func waitForSpreadLoaded(_ spreadView: EPUBSpreadView) async -> Bool {
+        // Do not await EPUBSpreadView.spreadLoaded() here: it is backed by a
+        // continuation and cannot be safely cancelled while a detached WebKit
+        // process is being torn down. Polling gives both cancellation and a
+        // bounded cleanup path.
+        for _ in 0..<300 {
+            if spreadView.isSpreadReady { return true }
+            if Task.isCancelled { return false }
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        return false
+    }
+
+    private func stableSnapshot(of spreadView: EPUBSpreadView) async -> UIImage? {
+        let deadline = DispatchTime.now().uptimeNanoseconds + 750_000_000
+        guard spreadView.isSpreadReady,
+              await waitForStablePaint(of: spreadView, deadline: deadline),
+              !Task.isCancelled
+        else { return nil }
+        return await snapshot(of: spreadView.webView, deadline: deadline)
+    }
+
+    private func waitForStablePaint(of spreadView: EPUBSpreadView, deadline: UInt64) async -> Bool {
+        guard spreadView.isSpreadReady else { return false }
+        guard deadline > DispatchTime.now().uptimeNanoseconds else { return false }
+        let barrier = TwoFramePaintBarrier()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                barrier.start(continuation, deadline: deadline)
+            }
+        }, onCancel: {
+            Task { @MainActor in
+                barrier.cancel()
+            }
+        })
+    }
+
+    private func renderAdjacentPage(in renderer: EPUBReflowableSpreadView, direction: NavigatorPageDirection) async -> UIImage? {
+        let visualDirection: EPUBSpreadView.Direction = direction == .forward
+            ? (viewModel.readingProgression == .rtl ? .left : .right)
+            : (viewModel.readingProgression == .rtl ? .right : .left)
+        let previousProgression = renderer.currentProgression
+        guard await renderer.go(to: visualDirection, options: .none) else {
+            return nil
+        }
+        // The renderer must publish a new progression after the detached go.
+        // Merely waiting a fixed duration would allow a delayed callback to
+        // leave the surface identified by the origin page.
+        guard await waitForReflowProgressionChange(renderer, from: previousProgression) else {
+            return nil
+        }
+        return await stableSnapshot(of: renderer)
+    }
+
+    private func waitForReflowProgressionChange(
+        _ renderer: EPUBReflowableSpreadView,
+        from previous: ClosedRange<Double>?
+    ) async -> Bool {
+        for _ in 0..<90 {
+            if let progression = renderer.currentProgression,
+               progression != previous
+            {
+                return true
+            }
+            if Task.isCancelled { return false }
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        return false
     }
 
     public func invalidateAdjacentPageSurfaces() {
+        if adjacentPageTransaction?.phase == .committing {
+            // External navigation requests takeover, but the live mutation
+            // still owns the navigator until its goToIndex call returns.
+            // This preserves the jump/jumped pair and prevents a second
+            // mutation from racing the first one.
+            adjacentPageTransaction?.externalNavigationRequested = true
+            adjacentPageTransaction?.cancelRequested = true
+            adjacentPageGeneration &+= 1
+            for surface in adjacentPageCache.values {
+                surface.invalidate()
+            }
+            adjacentPageCache.removeAll()
+            adjacentPageReadiness = [.backward: .unavailable, .forward: .unavailable]
+            return
+        }
+
         adjacentPageGeneration &+= 1
-        adjacentPageSurface?.invalidate()
-        adjacentPageSurface = nil
-        adjacentPageToken = nil
+        adjacentPageTransaction?.surface.invalidate()
+        adjacentPageTransaction = nil
         for surface in adjacentPageCache.values {
             surface.invalidate()
         }
         adjacentPageCache.removeAll()
+        adjacentPageReadiness = [.backward: .unavailable, .forward: .unavailable]
     }
 
     @discardableResult
-    public func commitAdjacentPage(_ surface: NavigatorPageSurface) async -> Bool {
-        guard
-            let activeSurface = adjacentPageSurface,
-            activeSurface === surface,
-            activeSurface.token == adjacentPageToken,
-            activeSurface.isValid,
-            activeSurface.generation == adjacentPageGeneration
+    public func commitAdjacentPageResult(_ surface: NavigatorPageSurface) async -> NavigatorPageCommitResult {
+        guard var transaction = adjacentPageTransaction,
+              transaction.phase == .prepared,
+              transaction.surface === surface,
+              surface.isValid,
+              surface.generation == adjacentPageGeneration
         else {
-            return false
+            return .indeterminate
         }
 
-        let (location, _) = await computeCurrentLocationAndViewport()
-        guard let location, location.matchesAdjacentPageOrigin(activeSurface.origin) else {
-            activeSurface.invalidate()
-            adjacentPageSurface = nil
-            adjacentPageToken = nil
-            return false
+        let activeSurface = transaction.surface
+        let transactionDeadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+        transaction.phase = .committing
+        adjacentPageTransaction = transaction
+        defer {
+            finishAdjacentPageCommit(surface: activeSurface)
         }
+
+        let (location, _) = await computeCurrentLocationAndViewport(deadline: transactionDeadline)
+        guard DispatchTime.now().uptimeNanoseconds < transactionDeadline else {
+            return .indeterminate
+        }
+        guard ownsAdjacentPageTransaction(surface), !isExternalNavigationRequested else {
+            return .indeterminate
+        }
+        guard let location, location.matchesAdjacentPageOrigin(activeSurface.origin) else {
+            return .indeterminate
+        }
+        guard !isCancelRequested, !Task.isCancelled else { return .restored }
 
         suppressLocationNotifications = true
         isPerformingAdjacentPageNavigation = true
-        let moved = await go(to: activeSurface.locator, options: .none)
-        if Task.isCancelled, moved {
-            _ = await go(to: activeSurface.origin, options: .none)
-        }
-        isPerformingAdjacentPageNavigation = false
-        suppressLocationNotifications = false
+        let moved = await go(
+            to: activeSurface.locator,
+            options: .none,
+            allowAdjacentPageTransaction: true
+        )
 
-        guard moved, !Task.isCancelled else {
-            activeSurface.invalidate()
-            adjacentPageSurface = nil
-            adjacentPageToken = nil
-            updateCurrentLocation()
-            return false
+        guard ownsAdjacentPageTransaction(surface), !isExternalNavigationRequested else {
+            return await reconcileAdjacentPageOutcome(activeSurface, deadline: transactionDeadline)
+        }
+
+        if !moved || isCancelRequested || Task.isCancelled {
+            // Once target navigation has started, cancellation is a request
+            // to restore the origin, not permission to discard the only
+            // locator which can safely undo it.
+            return await restoreAdjacentPageOrigin(activeSurface, deadline: transactionDeadline)
+        }
+
+        guard await waitForSettledTarget(activeSurface, deadline: transactionDeadline),
+              ownsAdjacentPageTransaction(surface),
+              !isCancelRequested,
+              !isExternalNavigationRequested,
+              !Task.isCancelled
+        else {
+            return await restoreAdjacentPageOrigin(activeSurface, deadline: transactionDeadline)
         }
 
         // Every cached neighbor was rendered for the old origin. Once the
@@ -967,20 +1604,254 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             cachedSurface.invalidate()
         }
         adjacentPageCache.removeAll()
-        activeSurface.invalidate()
-        adjacentPageSurface = nil
-        adjacentPageToken = nil
         updateCurrentLocation()
+        return .committed
+    }
+
+    /// Reconciles a commit whose transaction ended without proving whether
+    /// the target or origin won. This method never navigates: it only observes
+    /// the real locator and waits for a stable visible paint before reporting
+    /// a terminal outcome.
+    public func reconcileAdjacentPageResult(
+        _ surface: NavigatorPageSurface,
+        deadline: UInt64
+    ) async -> NavigatorPageCommitResult {
+        for _ in 0..<60 {
+            guard !Task.isCancelled,
+                  DispatchTime.now().uptimeNanoseconds < deadline else { return .indeterminate }
+            if let current = (await computeCurrentLocationAndViewport(deadline: deadline)).0 {
+                if targetLocationMatches(current, surface),
+                   await waitForStableVisibleAdjacentPage(deadline: deadline) {
+                    return .committed
+                }
+                if current.matchesAdjacentPageOrigin(surface.origin),
+                   await waitForStableVisibleAdjacentPage(deadline: deadline) {
+                    return .restored
+                }
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return .indeterminate }
+            try? await Task.sleep(nanoseconds: min(16_000_000, deadline - now))
+        }
+        return .indeterminate
+    }
+
+    private func waitForStableVisibleAdjacentPage(deadline: UInt64) async -> Bool {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView,
+              spread.isSpreadReady,
+              await waitForStablePaint(of: spread, deadline: deadline),
+              await snapshot(of: spread.webView, deadline: deadline) != nil
+        else { return false }
         return true
     }
 
+    private func ownsAdjacentPageTransaction(_ surface: NavigatorPageSurface) -> Bool {
+        adjacentPageTransaction?.phase == .committing
+            && adjacentPageTransaction?.surface === surface
+    }
+
+    private var isCancelRequested: Bool {
+        adjacentPageTransaction?.cancelRequested == true
+    }
+
+    private var isExternalNavigationRequested: Bool {
+        adjacentPageTransaction?.externalNavigationRequested == true
+    }
+
+    private func finishAdjacentPageCommit(surface: NavigatorPageSurface) {
+        guard let transaction = adjacentPageTransaction,
+              transaction.surface === surface else { return }
+        let shouldRefreshLocation = !transaction.externalNavigationRequested
+        surface.invalidate()
+        adjacentPageTransaction = nil
+        for surface in adjacentPageCache.values {
+            surface.invalidate()
+        }
+        adjacentPageCache.removeAll()
+        adjacentPageReadiness = [.backward: .unavailable, .forward: .unavailable]
+        isPerformingAdjacentPageNavigation = false
+        suppressLocationNotifications = false
+        if shouldRefreshLocation {
+            updateCurrentLocation()
+        }
+    }
+
+    private func restoreAdjacentPageOrigin(
+        _ surface: NavigatorPageSurface,
+        deadline: UInt64
+    ) async -> NavigatorPageCommitResult {
+        // Keep rollback on the navigator's actor even when the gesture task
+        // itself was cancelled; the mutation must finish before takeover.
+        let restoration = Task { @MainActor [weak self] in
+            guard let self else { return .indeterminate }
+            return await self.performAdjacentPageOriginRestore(surface, deadline: deadline)
+        }
+        return await restoration.value
+    }
+
+    private func performAdjacentPageOriginRestore(
+        _ surface: NavigatorPageSurface,
+        deadline: UInt64
+    ) async -> NavigatorPageCommitResult {
+        // Retry the compensating navigation once. Each attempt is bounded by
+        // waitForSettledOrigin; after every failed attempt, reconcile the
+        // actual locator before deciding whether another go is safe.
+        for _ in 0..<2 {
+            if !isExternalNavigationRequested,
+               ownsAdjacentPageTransaction(surface)
+            {
+                let moved = await go(
+                    to: surface.origin,
+                    options: .none,
+                    allowAdjacentPageTransaction: true
+                )
+                if moved,
+                   ownsAdjacentPageTransaction(surface),
+                   !isExternalNavigationRequested,
+                   await waitForSettledOrigin(surface, deadline: deadline)
+                {
+                    return .restored
+                }
+            }
+
+            let outcome = await reconcileAdjacentPageOutcome(surface, deadline: deadline)
+            switch outcome {
+            case .committed, .restored:
+                return outcome
+            case .indeterminate:
+                continue
+            }
+        }
+
+        return await reconcileAdjacentPageOutcome(surface, deadline: deadline)
+    }
+
+    /// Reads the post-failure navigator state without navigating. This is the
+    /// final guard against reporting a failed commit when the target actually
+    /// won, or asking an upper layer to tear down a transition whose location
+    /// is not known yet.
+    private func reconcileAdjacentPageOutcome(
+        _ surface: NavigatorPageSurface,
+        deadline: UInt64
+    ) async -> NavigatorPageCommitResult {
+        guard let current = (await computeCurrentLocationAndViewport(deadline: deadline)).0 else {
+            return .indeterminate
+        }
+        if targetLocationMatches(current, surface) {
+            return .committed
+        }
+        if current.matchesAdjacentPageOrigin(surface.origin) {
+            return .restored
+        }
+        return .indeterminate
+    }
+
+    private func waitForSettledOrigin(
+        _ surface: NavigatorPageSurface,
+        deadline: UInt64
+    ) async -> Bool {
+        for _ in 0..<60 {
+            guard DispatchTime.now().uptimeNanoseconds < deadline,
+                  ownsAdjacentPageTransaction(surface),
+                  !isExternalNavigationRequested
+            else { return false }
+
+            if let current = (await computeCurrentLocationAndViewport(deadline: deadline)).0,
+               ownsAdjacentPageTransaction(surface),
+               current.matchesAdjacentPageOrigin(surface.origin),
+               let spread = paginationView?.currentView as? EPUBSpreadView,
+               spread.isSpreadReady
+            {
+                guard await waitForStablePaint(of: spread, deadline: deadline),
+                      ownsAdjacentPageTransaction(surface),
+                      !isExternalNavigationRequested
+                else { return false }
+                guard await snapshot(of: spread.webView, deadline: deadline) != nil,
+                      ownsAdjacentPageTransaction(surface),
+                      !isExternalNavigationRequested
+                else { return false }
+                return true
+            }
+
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        return false
+    }
+
+    private func isActiveAdjacentSurface(_ surface: NavigatorPageSurface) -> Bool {
+        guard let activeSurface = adjacentPageTransaction?.surface else { return false }
+        return activeSurface === surface
+            && activeSurface.isValid
+            && activeSurface.generation == adjacentPageGeneration
+    }
+
+    private func waitForSettledTarget(
+        _ surface: NavigatorPageSurface,
+        deadline: UInt64
+    ) async -> Bool {
+        let target = surface.locator
+        for _ in 0..<60 {
+            guard DispatchTime.now().uptimeNanoseconds < deadline,
+                  isActiveAdjacentSurface(surface),
+                  !isCancelRequested,
+                  !isExternalNavigationRequested
+            else { return false }
+            if let current = (await computeCurrentLocationAndViewport(deadline: deadline)).0,
+               isActiveAdjacentSurface(surface),
+               targetLocationMatches(current, surface),
+               let spread = paginationView?.currentView as? EPUBSpreadView,
+               spread.isSpreadReady
+            {
+                // Keep the immutable surface in place through two complete
+                // run-loop turns. This prevents WebKit's first post-navigation
+                // paint from flashing through the transition layer.
+                guard await waitForStablePaint(of: spread, deadline: deadline), isActiveAdjacentSurface(surface) else {
+                    return false
+                }
+                guard await snapshot(of: spread.webView, deadline: deadline) != nil, isActiveAdjacentSurface(surface) else {
+                    return false
+                }
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        return false
+    }
+
+    private func targetLocationMatches(_ current: Locator, _ surface: NavigatorPageSurface) -> Bool {
+        let target = surface.locator
+        if publication.metadata.layout == .fixed {
+            // A fixed spread can expose either leaf as its current locator,
+            // even though the transaction has a directional leaf identity.
+            // Verify that the committed spread contains that exact leaf; a
+            // matching href alone is not sufficient to prove the spread has
+            // settled (and would be wrong for a double-page spread).
+            guard let leafIndex = surface.leafIndex,
+                  let spread = paginationView?.currentView as? EPUBSpreadView,
+                  spread.spread.contains(index: leafIndex)
+            else { return false }
+            return true
+        }
+        guard current.href.isEquivalentTo(target.href) else { return false }
+        guard let expected = target.locations.progression,
+              let actual = current.locations.progression
+        else { return false }
+        return abs(expected - actual) < 0.005
+    }
+
     public func cancelAdjacentPage(_ surface: NavigatorPageSurface) {
-        guard adjacentPageSurface === surface, surface.token == adjacentPageToken else {
+        guard let transaction = adjacentPageTransaction,
+              transaction.surface === surface else {
+            return
+        }
+        if transaction.phase == .committing {
+            // Commit owns the origin once navigation has begun. Let it
+            // observe the cancellation and perform the bounded rollback.
+            adjacentPageTransaction?.cancelRequested = true
             return
         }
         surface.invalidate()
-        adjacentPageSurface = nil
-        adjacentPageToken = nil
+        adjacentPageTransaction = nil
     }
 
     /// Last current location notified to the delegate.
@@ -1009,9 +1880,38 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    private func waitForAdjacentPageTransactionToSettle() async -> Bool {
+        for _ in 0..<180 {
+            if adjacentPageTransaction == nil {
+                return true
+            }
+            if Task.isCancelled { return false }
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        return adjacentPageTransaction == nil
+    }
+
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
-        guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
-        if !isPerformingAdjacentPageNavigation {
+        guard await waitForAdjacentPageTransactionToSettle() else { return false }
+        return await go(
+            to: locator,
+            options: options,
+            allowAdjacentPageTransaction: false
+        )
+    }
+
+    private func go(
+        to locator: Locator,
+        options: NavigatorGoOptions,
+        allowAdjacentPageTransaction: Bool
+    ) async -> Bool {
+        let owningSurface = allowAdjacentPageTransaction
+            ? adjacentPageTransaction?.surface
+            : nil
+        if allowAdjacentPageTransaction {
+            guard owningSurface != nil, isPerformingAdjacentPageNavigation else { return false }
+        } else {
+            guard adjacentPageTransaction == nil else { return false }
             invalidateAdjacentPageSurfaces()
         }
         let locator = publication.normalizeLocator(locator)
@@ -1026,6 +1926,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         let success = await paginationView.goToIndex(spreadIndex, location: .locator(locator), options: options)
+        if let owningSurface, !ownsAdjacentPageTransaction(owningSurface) {
+            return false
+        }
         on(.jumped)
         if success, !suppressLocationNotifications {
             delegate?.navigator(self, didJumpTo: locator)
@@ -1042,10 +1945,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @discardableResult
     public func goForward(options: NavigatorGoOptions) async -> Bool {
-        guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
-        if !isPerformingAdjacentPageNavigation {
-            invalidateAdjacentPageSurfaces()
-        }
+        guard await waitForAdjacentPageTransactionToSettle(), adjacentPageTransaction == nil else { return false }
+        invalidateAdjacentPageSurfaces()
         let direction: EPUBSpreadView.Direction = {
             switch viewModel.readingProgression {
             case .ltr:
@@ -1059,10 +1960,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @discardableResult
     public func goBackward(options: NavigatorGoOptions) async -> Bool {
-        guard adjacentPageToken == nil || isPerformingAdjacentPageNavigation else { return false }
-        if !isPerformingAdjacentPageNavigation {
-            invalidateAdjacentPageSurfaces()
-        }
+        guard await waitForAdjacentPageTransactionToSettle(), adjacentPageTransaction == nil else { return false }
+        invalidateAdjacentPageSurfaces()
         let direction: EPUBSpreadView.Direction = {
             switch viewModel.readingProgression {
             case .ltr:
@@ -1567,24 +2466,44 @@ extension EPUBNavigatorViewController: EditingActionsControllerDelegate {
 }
 
 extension EPUBNavigatorViewController: PaginationViewDelegate {
-    func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)? {
-        let spread = spreads[index]
-        let spreadViewType = (publication.metadata.layout == .fixed) ? EPUBFixedSpreadView.self : EPUBReflowableSpreadView.self
-        let spreadView = spreadViewType.init(
-            viewModel: viewModel,
-            spread: spread,
-            scripts: [],
-            animatedLoad: false
-        )
-        spreadView.delegate = self
-        if !settings.scroll {
-            spreadView.webView.scrollView.isScrollEnabled = isUserPageTurnInteractionEnabled
+    private func configuredUserScripts() -> [WKUserScript] {
+        let userContentController = WKUserContentController()
+        delegate?.navigator(self, setupUserScripts: userContentController)
+        return userContentController.userScripts
+    }
+
+    private func makeSpreadView(for spread: EPUBSpread, receivesNavigatorEvents: Bool) -> EPUBSpreadView {
+        let scripts = configuredUserScripts()
+        let spreadView: EPUBSpreadView
+        if publication.metadata.layout == .fixed {
+            spreadView = EPUBFixedSpreadView(
+                viewModel: viewModel,
+                spread: spread,
+                scripts: scripts,
+                animatedLoad: false
+            )
+        } else {
+            spreadView = EPUBReflowableSpreadView(
+                viewModel: viewModel,
+                spread: spread,
+                scripts: scripts,
+                animatedLoad: false
+            )
         }
 
-        let userContentController = spreadView.webView.configuration.userContentController
-        delegate?.navigator(self, setupUserScripts: userContentController)
+        if receivesNavigatorEvents {
+            spreadView.delegate = self
+        }
+        if !settings.scroll {
+            spreadView.webView.scrollView.isScrollEnabled = receivesNavigatorEvents && isUserPageTurnInteractionEnabled
+        }
 
         return spreadView
+    }
+
+    func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)? {
+        let spread = spreads[index]
+        return makeSpreadView(for: spread, receivesNavigatorEvents: true)
     }
 
     func paginationViewDidUpdateViews(_ paginationView: PaginationView) {

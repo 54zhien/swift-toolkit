@@ -4,8 +4,73 @@
 //  available in the top-level LICENSE file of the project.
 //
 
+import Foundation
 import ReadiumShared
+import UIKit
 @preconcurrency import WebKit
+
+/// A cancellation/timeout-safe bridge for UIKit/WebKit completion handlers.
+/// Both the callback and the timeout may race; only the first one resumes the
+/// Swift continuation.
+private final class OneShotContinuation<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Never>?
+    private var finished = false
+    private var pendingValue: Value?
+    private var hasPendingValue = false
+    private var timeoutTask: Task<Void, Never>?
+
+    func install(_ continuation: CheckedContinuation<Value, Never>) {
+        var value: Value?
+        var shouldResume = false
+        var hasValue = false
+        lock.lock()
+        if finished {
+            value = pendingValue
+            shouldResume = true
+            hasValue = hasPendingValue
+        } else {
+            self.continuation = continuation
+        }
+        lock.unlock()
+
+        if shouldResume, hasValue {
+            continuation.resume(returning: value!)
+        }
+    }
+
+    func attachTimeout(_ task: Task<Void, Never>) {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            task.cancel()
+        } else {
+            timeoutTask = task
+            lock.unlock()
+        }
+    }
+
+    func resume(_ value: Value) {
+        var continuation: CheckedContinuation<Value, Never>?
+        var timeoutTask: Task<Void, Never>?
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        if let waiting = self.continuation {
+            continuation = waiting
+        } else {
+            pendingValue = value
+            hasPendingValue = true
+        }
+        timeoutTask = self.timeoutTask
+        lock.unlock()
+        timeoutTask?.cancel()
+        continuation?.resume(returning: value)
+    }
+}
 
 protocol EPUBSpreadViewDelegate: AnyObject {
     /// Returns the content inset the spread view should use.
@@ -59,7 +124,16 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private var activityIndicatorStopWorkItem: DispatchWorkItem?
 
     private(set) var isSpreadLoaded = false
+    /// Set only after the subclass has applied its initial pending location
+    /// and the first layout pass is complete. `isSpreadLoaded` is intentionally
+    /// earlier and must not be used as a transition-rendering readiness signal.
+    private(set) var isSpreadReady = false
     private var spreadLoadTask: Task<Void, Never>?
+
+    /// Content inset used by a detached transition renderer. It is kept
+    /// separate from the delegate so rendering a neighboring page cannot
+    /// send navigator callbacks or alter the visible spread.
+    var surfaceContentInset: UIEdgeInsets?
 
     required init(
         viewModel: EPUBNavigatorViewModel,
@@ -113,6 +187,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// clear pending operations and retain cycles.
     func clear() {
         webView.stopLoading()
+
+        isSpreadReady = false
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
@@ -173,19 +249,64 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Evaluates the given JavaScript into the resource's HTML page.
     @discardableResult
     func evaluateScript(_ script: String, inHREF href: AnyURL? = nil) async -> Result<Any, Error> {
-        await spreadLoaded()
+        guard await waitUntilSpreadLoaded() else {
+            return .failure(NSError(
+                domain: "ReadiumNavigator.EPUBSpreadView",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for the spread to load"]
+            ))
+        }
 
         log(.trace, "Evaluate script: \(script)")
-        return await withCheckedContinuation { continuation in
-            webView.evaluateJavaScript(script) { [weak self] res, error in
-                if let error = error {
-                    self?.log(.error, error)
-                    continuation.resume(returning: .failure(error))
-                } else {
-                    continuation.resume(returning: .success(res ?? ()))
+        let gate = OneShotContinuation<Result<Any, Error>>()
+        let result = await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Result<Any, Error>, Never>) in
+                gate.install(continuation)
+                guard !Task.isCancelled else {
+                    gate.resume(.failure(NSError(
+                        domain: "ReadiumNavigator.EPUBSpreadView",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "JavaScript evaluation cancelled"]
+                    )))
+                    return
                 }
+
+                webView.evaluateJavaScript(script) { [weak self] res, error in
+                    if let error {
+                        self?.log(.error, error)
+                        gate.resume(.failure(error))
+                    } else {
+                        gate.resume(.success(res ?? ()))
+                    }
+                }
+
+                let timeoutTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    gate.resume(.failure(NSError(
+                        domain: "ReadiumNavigator.EPUBSpreadView",
+                        code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: "JavaScript evaluation timed out"]
+                    )))
+                }
+                gate.attachTimeout(timeoutTask)
             }
+        }, onCancel: {
+            gate.resume(.failure(NSError(
+                domain: "ReadiumNavigator.EPUBSpreadView",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "JavaScript evaluation cancelled"]
+            )))
+        })
+        return result
+    }
+
+    private func waitUntilSpreadLoaded() async -> Bool {
+        for _ in 0..<300 {
+            if isSpreadLoaded { return true }
+            if Task.isCancelled { return false }
+            try? await Task.sleep(nanoseconds: 16_000_000)
         }
+        return false
     }
 
     /// Called from the JS code when logging a message.
@@ -403,6 +524,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             await spreadDidLoad()
             await delegate?.spreadViewDidLoad(self)
             onSpreadLoadedCallbacks.complete()
+            guard !Task.isCancelled else { return }
+            layoutIfNeeded()
+            isSpreadReady = true
             showSpread()
         }
     }
