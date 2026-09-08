@@ -417,8 +417,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var adjacentPageCache: [NavigatorPageDirection: NavigatorPageSurface] = [:]
     private var preparedCurrentPageSurfaceCache: NavigatorCurrentPageSurface?
     private var adjacentPageReadiness: [NavigatorPageDirection: NavigatorPageSurfaceReadiness] = [
-        .backward: .unavailable,
-        .forward: .unavailable,
+        .backward: .unknown,
+        .forward: .unknown,
     ]
     private var isPrewarmingAdjacentPages = false
     private var suppressLocationNotifications = false
@@ -987,7 +987,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Adjacent page surfaces
 
-    public func prewarmAdjacentPageSurfaces() async {
+    public func prewarmAdjacentPageSurfaces(preferredDirection: NavigatorPageDirection) async {
         guard !isPrewarmingAdjacentPages, state == .idle, adjacentPageTransaction == nil else {
             return
         }
@@ -1003,7 +1003,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 for direction in [NavigatorPageDirection.backward, .forward]
                     where adjacentPageReadiness[direction] == .preparing
                 {
-                    adjacentPageReadiness[direction] = .unavailable
+                    adjacentPageReadiness[direction] = .unknown
                 }
             }
         }
@@ -1031,10 +1031,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // Keep the cache useful across consecutive turns. This method only
         // reads already-loaded spread views or creates a detached renderer;
         // it never moves the visible navigator.
-        for direction in [NavigatorPageDirection.backward, .forward] {
+        let opposite: NavigatorPageDirection = preferredDirection == .forward ? .backward : .forward
+        for direction in [preferredDirection, opposite] {
             guard prewarmEpoch == adjacentPageGeneration, !Task.isCancelled else { return }
             if let surface = adjacentPageCache[direction], surface.isValid {
                 adjacentPageReadiness[direction] = .ready
+                continue
+            }
+            if adjacentPageReadiness[direction] == .unavailable {
                 continue
             }
             adjacentPageReadiness[direction] = .preparing
@@ -1055,7 +1059,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func adjacentPageReadiness(direction: NavigatorPageDirection) -> NavigatorPageSurfaceReadiness {
-        adjacentPageReadiness[direction] ?? .unavailable
+        adjacentPageReadiness[direction] ?? .unknown
     }
 
     public func preparedCurrentPageSurface() -> NavigatorCurrentPageSurface? {
@@ -1481,7 +1485,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // continuation and cannot be safely cancelled while a detached WebKit
         // process is being torn down. Polling gives both cancellation and a
         // bounded cleanup path.
-        for _ in 0..<300 {
+        for _ in 0..<120 {
             if spreadView.isSpreadReady { return true }
             if Task.isCancelled { return false }
             try? await Task.sleep(nanoseconds: 16_000_000)
@@ -1560,7 +1564,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
             adjacentPageCache.removeAll()
             preparedCurrentPageSurfaceCache = nil
-            adjacentPageReadiness = [.backward: .unavailable, .forward: .unavailable]
+            adjacentPageReadiness = [.backward: .unknown, .forward: .unknown]
             return
         }
 
@@ -1572,7 +1576,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         adjacentPageCache.removeAll()
         preparedCurrentPageSurfaceCache = nil
-        adjacentPageReadiness = [.backward: .unavailable, .forward: .unavailable]
+        adjacentPageReadiness = [.backward: .unknown, .forward: .unknown]
     }
 
     @discardableResult
@@ -1730,7 +1734,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         adjacentPageCache.removeAll()
         preparedCurrentPageSurfaceCache = nil
         adjacentPageGeneration &+= 1
-        adjacentPageReadiness = [.backward: .unavailable, .forward: .unavailable]
+        adjacentPageReadiness = [.backward: .unknown, .forward: .unknown]
         isPerformingAdjacentPageNavigation = false
         suppressLocationNotifications = false
         if shouldRefreshLocation {

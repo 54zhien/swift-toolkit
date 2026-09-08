@@ -16,6 +16,7 @@ public enum NavigatorPageDirection: Hashable, Sendable {
 
 /// The result of warming one side of the page-turn cache.
 public enum NavigatorPageSurfaceReadiness: Equatable, Sendable {
+    case unknown
     case unavailable
     case preparing
     case ready
@@ -171,7 +172,7 @@ public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
     ///
     /// The operation must leave the visible navigator at its original
     /// location, even when a direction is unavailable or fails to render.
-    func prewarmAdjacentPageSurfaces() async
+    func prewarmAdjacentPageSurfaces(preferredDirection: NavigatorPageDirection) async
 
     /// Returns the current page captured alongside the neighboring cache.
     /// This is synchronous so gesture handling never starts WebKit work.
