@@ -181,6 +181,10 @@ public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
     /// Returns the latest cache state for a direction without starting work.
     func adjacentPageReadiness(direction: NavigatorPageDirection) -> NavigatorPageSurfaceReadiness
 
+    /// Peeks at a prepared surface without consuming its single-use
+    /// transaction ownership. This is intended for off-gesture GPU upload.
+    func preparedAdjacentPageSurface(direction: NavigatorPageDirection) -> NavigatorPageSurface?
+
     /// Invalidates all prepared surfaces and bumps their generation.
     /// Call this after a settings, size, theme or external navigation change.
     func invalidateAdjacentPageSurfaces()

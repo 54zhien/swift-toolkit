@@ -1086,6 +1086,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         preparedCurrentPageSurfaceCache
     }
 
+    public func preparedAdjacentPageSurface(
+        direction: NavigatorPageDirection
+    ) -> NavigatorPageSurface? {
+        guard state == .idle,
+              adjacentPageTransaction == nil,
+              let surface = adjacentPageCache[direction],
+              surface.isValid,
+              surface.generation == adjacentPageGeneration else { return nil }
+        return surface
+    }
+
     public func takePreparedAdjacentPage(direction: NavigatorPageDirection) -> NavigatorPageSurface? {
         // This method is intentionally O(1) during a gesture. If the
         // background warm-up did not finish, the caller must apply the light
