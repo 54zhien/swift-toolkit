@@ -402,6 +402,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// interactive transition only takes one out of this cache; it never
     /// navigates the live WebView or captures a snapshot.
     private var adjacentPageGeneration = 0
+    private let adjacentPageProgressionTolerance = 0.01
     private enum AdjacentPageTransactionPhase: Equatable {
         case prepared
         case committing
@@ -1580,7 +1581,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         let activeSurface = transaction.surface
-        let transactionDeadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+        let transactionDeadline = adjacentPageDeadline(after: 2_000_000_000)
         transaction.phase = .committing
         adjacentPageTransaction = transaction
         defer {
@@ -1611,20 +1612,42 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return await reconcileAdjacentPageOutcome(activeSurface, deadline: transactionDeadline)
         }
 
-        if !moved || isCancelRequested || Task.isCancelled {
-            // Once target navigation has started, cancellation is a request
-            // to restore the origin, not permission to discard the only
-            // locator which can safely undo it.
-            return await restoreAdjacentPageOrigin(activeSurface, deadline: transactionDeadline)
+        if isCancelRequested || Task.isCancelled {
+            return await restoreAdjacentPageOrigin(
+                activeSurface,
+                deadline: adjacentPageDeadline(after: 1_200_000_000)
+            )
         }
 
-        guard await waitForSettledTarget(activeSurface, deadline: transactionDeadline),
-              ownsAdjacentPageTransaction(surface),
-              !isCancelRequested,
-              !isExternalNavigationRequested,
-              !Task.isCancelled
-        else {
-            return await restoreAdjacentPageOrigin(activeSurface, deadline: transactionDeadline)
+        if !moved {
+            let outcome = await resolveAdjacentPageLocation(
+                activeSurface,
+                deadline: adjacentPageDeadline(after: 600_000_000)
+            )
+            guard outcome == .indeterminate else { return outcome }
+            return await restoreAdjacentPageOrigin(
+                activeSurface,
+                deadline: adjacentPageDeadline(after: 1_200_000_000)
+            )
+        }
+
+        guard await waitForSettledTarget(activeSurface, deadline: transactionDeadline) else {
+            if isCancelRequested || Task.isCancelled {
+                return await restoreAdjacentPageOrigin(
+                    activeSurface,
+                    deadline: adjacentPageDeadline(after: 1_200_000_000)
+                )
+            }
+            return await resolveAdjacentPageLocation(
+                activeSurface,
+                deadline: adjacentPageDeadline(after: 600_000_000)
+            )
+        }
+        guard ownsAdjacentPageTransaction(surface), !isExternalNavigationRequested else {
+            return await resolveAdjacentPageLocation(
+                activeSurface,
+                deadline: adjacentPageDeadline(after: 600_000_000)
+            )
         }
 
         // Every cached neighbor was rendered for the old origin. Once the
@@ -1778,6 +1801,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return .indeterminate
     }
 
+    /// Resolves the actual navigator position without mutating it. A slow
+    /// stable paint must never be interpreted as permission to navigate back.
+    private func resolveAdjacentPageLocation(
+        _ surface: NavigatorPageSurface,
+        deadline: UInt64
+    ) async -> NavigatorPageCommitResult {
+        await reconcileAdjacentPageOutcome(surface, deadline: deadline)
+    }
+
+    private func adjacentPageDeadline(after duration: UInt64) -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds &+ duration
+    }
+
     private func waitForSettledOrigin(
         _ surface: NavigatorPageSurface,
         deadline: UInt64
@@ -1868,7 +1904,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let expected = target.locations.progression,
               let actual = current.locations.progression
         else { return false }
-        return abs(expected - actual) < 0.005
+        let delta = abs(expected - actual)
+#if DEBUG
+        if delta >= adjacentPageProgressionTolerance {
+            print(
+                "Adjacent page mismatch expected=\(expected) actual=\(actual) "
+                    + "delta=\(delta) href=\(target.href) generation=\(surface.generation)"
+            )
+        }
+#endif
+        return delta < adjacentPageProgressionTolerance
     }
 
     public func cancelAdjacentPage(_ surface: NavigatorPageSurface) {
