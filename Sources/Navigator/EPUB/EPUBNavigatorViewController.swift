@@ -1854,7 +1854,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
               await waitForStableVisibleAdjacentPage(deadline: deadline) else {
             return .indeterminate
         }
-        return outcome
+        let confirmedOutcome = await reconcileAdjacentPageOutcome(surface, deadline: deadline)
+        return confirmedOutcome == outcome ? outcome : .indeterminate
     }
 
     private func adjacentPageDeadline(after duration: UInt64) -> UInt64 {
