@@ -1008,7 +1008,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }
 
-        if let currentLocation = (await computeCurrentLocationAndViewport()).0,
+        let preparedOrigin = (await computeCurrentLocationAndViewport()).0
+        guard prewarmEpoch == adjacentPageGeneration,
+              state == .idle,
+              adjacentPageTransaction == nil,
+              !Task.isCancelled else { return }
+
+        if let currentLocation = preparedOrigin,
            let currentView = paginationView?.currentView as? EPUBSpreadView,
            currentView.isSpreadReady,
            let image = await stableSnapshot(of: currentView),
@@ -1033,7 +1039,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // it never moves the visible navigator.
         let opposite: NavigatorPageDirection = preferredDirection == .forward ? .backward : .forward
         for direction in [preferredDirection, opposite] {
-            guard prewarmEpoch == adjacentPageGeneration, !Task.isCancelled else { return }
+            guard prewarmEpoch == adjacentPageGeneration,
+                  state == .idle,
+                  adjacentPageTransaction == nil,
+                  !Task.isCancelled else { return }
             if let surface = adjacentPageCache[direction], surface.isValid {
                 adjacentPageReadiness[direction] = .ready
                 continue
@@ -1042,12 +1051,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 continue
             }
             adjacentPageReadiness[direction] = .preparing
-            let result = await buildAdjacentPageSurface(direction: direction)
-            guard prewarmEpoch == adjacentPageGeneration, !Task.isCancelled else { return }
+            guard let preparedOrigin else {
+                adjacentPageReadiness[direction] = .failed
+                continue
+            }
+            let result = await buildAdjacentPageSurface(
+                direction: direction,
+                origin: preparedOrigin,
+                generation: prewarmEpoch
+            )
+            guard prewarmEpoch == adjacentPageGeneration,
+                  state == .idle,
+                  adjacentPageTransaction == nil,
+                  !Task.isCancelled else { return }
             if let surface = result.surface {
                 guard surface.generation == adjacentPageGeneration else {
                     surface.invalidate()
-                    adjacentPageReadiness[direction] = .unavailable
+                    adjacentPageReadiness[direction] = .unknown
                     continue
                 }
                 adjacentPageCache[direction] = surface
@@ -1079,7 +1099,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         adjacentPageTransaction = AdjacentPageTransaction(surface: surface, phase: .prepared)
-        adjacentPageReadiness[direction] = .unavailable
+        adjacentPageReadiness[direction] = .unknown
         return surface
     }
 
@@ -1094,13 +1114,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let leafIndex: Int
     }
 
-    private func buildAdjacentPageSurface(direction: NavigatorPageDirection) async -> AdjacentSurfaceBuildResult {
+    private func buildAdjacentPageSurface(
+        direction: NavigatorPageDirection,
+        origin: Locator,
+        generation: Int
+    ) async -> AdjacentSurfaceBuildResult {
         guard state == .idle, adjacentPageTransaction == nil else {
-            return .init(surface: nil, readiness: .unavailable)
-        }
-        let generation = adjacentPageGeneration
-        guard let origin = (await computeCurrentLocationAndViewport()).0 else {
-            return .init(surface: nil, readiness: .unavailable)
+            return .init(surface: nil, readiness: .unknown)
         }
 
         let token = UUID()
@@ -1818,7 +1838,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         _ surface: NavigatorPageSurface,
         deadline: UInt64
     ) async -> NavigatorPageCommitResult {
-        await reconcileAdjacentPageOutcome(surface, deadline: deadline)
+        let outcome = await reconcileAdjacentPageOutcome(surface, deadline: deadline)
+        guard outcome != .indeterminate,
+              await waitForStableVisibleAdjacentPage(deadline: deadline) else {
+            return .indeterminate
+        }
+        return outcome
     }
 
     private func adjacentPageDeadline(after duration: UInt64) -> UInt64 {
@@ -1938,8 +1963,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             adjacentPageTransaction?.cancelRequested = true
             return
         }
+        let direction = transaction.surface.direction
         surface.invalidate()
         adjacentPageTransaction = nil
+        adjacentPageReadiness[direction] = .unknown
     }
 
     /// Last current location notified to the delegate.
