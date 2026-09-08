@@ -1008,7 +1008,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }
 
-        if let currentView = paginationView?.currentView as? EPUBSpreadView,
+        if let currentLocation = (await computeCurrentLocationAndViewport()).0,
+           let currentView = paginationView?.currentView as? EPUBSpreadView,
            currentView.isSpreadReady,
            let image = await stableSnapshot(of: currentView),
            prewarmEpoch == adjacentPageGeneration,
@@ -1016,7 +1017,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         {
             preparedCurrentPageSurfaceCache = NavigatorCurrentPageSurface(
                 image: image,
-                contentRect: pageSurfaceContentRect(in: currentView)
+                contentRect: pageSurfaceContentRect(in: currentView),
+                identity: NavigatorPagePositionIdentity(
+                    locator: currentLocation,
+                    generation: prewarmEpoch
+                ),
+                generation: prewarmEpoch
             )
         } else {
             preparedCurrentPageSurfaceCache = nil
@@ -1723,6 +1729,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         adjacentPageCache.removeAll()
         preparedCurrentPageSurfaceCache = nil
+        adjacentPageGeneration &+= 1
         adjacentPageReadiness = [.backward: .unavailable, .forward: .unavailable]
         isPerformingAdjacentPageNavigation = false
         suppressLocationNotifications = false

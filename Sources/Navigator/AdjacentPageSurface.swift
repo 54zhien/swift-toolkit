@@ -59,10 +59,27 @@ public struct NavigatorPageSurfaceGeometry: Equatable, Sendable {
 @MainActor public final class NavigatorCurrentPageSurface {
     public let image: UIImage
     public let geometry: NavigatorPageSurfaceGeometry
+    public let identity: NavigatorPagePositionIdentity
+    public let generation: Int
 
-    init(image: UIImage, contentRect: CGRect) {
+    init(image: UIImage, contentRect: CGRect, identity: NavigatorPagePositionIdentity, generation: Int) {
         self.image = image
         geometry = NavigatorPageSurfaceGeometry(image: image, contentRect: contentRect)
+        self.identity = identity
+        self.generation = generation
+    }
+}
+
+/// Direction-independent identity of the navigator position represented by a
+/// surface. Adjacent surfaces bind their origin to the current surface with
+/// this value before any animation is allowed to begin.
+public struct NavigatorPagePositionIdentity: Hashable, Sendable {
+    public let locator: Locator
+    public let generation: Int
+
+    public init(locator: Locator, generation: Int) {
+        self.locator = locator
+        self.generation = generation
     }
 }
 
@@ -101,12 +118,13 @@ public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
     public let image: UIImage
     public let geometry: NavigatorPageSurfaceGeometry
     public let identity: NavigatorPageSurfaceIdentity
+    public let originIdentity: NavigatorPagePositionIdentity
+    public var generation: Int { originIdentity.generation }
     public var leafHREF: AnyURL? { identity.leafHREF }
     public var leafIndex: Int? { identity.leafIndex }
 
     let token: UUID
     let origin: Locator
-    let generation: Int
     private(set) var isValid = true
 
     init(
@@ -132,8 +150,8 @@ public struct NavigatorPageSurfaceIdentity: Hashable, Sendable {
             leafIndex: leafIndex
         )
         self.origin = origin
+        originIdentity = NavigatorPagePositionIdentity(locator: origin, generation: generation)
         self.token = token
-        self.generation = generation
     }
 
     func invalidate() {
