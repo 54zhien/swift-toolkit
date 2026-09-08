@@ -60,10 +60,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
         scrollView.alwaysBounceHorizontal = false
 
         scrollView.isPagingEnabled = !viewModel.scroll
-        // In continuous mode the outer PaginationView owns scrolling. Keep
-        // the inner scroll enabled until the initial location is applied and
-        // the document height has been measured.
-        scrollView.isScrollEnabled = !viewModel.continuousScroll || !isContinuousPrepared
+        // In continuous mode the outer PaginationView is the only scroll
+        // owner. Programmatic positioning continues to work while user
+        // scrolling is disabled, so there is no need for two competing pans
+        // during the initial measurement window.
+        scrollView.isScrollEnabled = !viewModel.continuousScroll
 
         webView.translatesAutoresizingMaskIntoConstraints = false
         topConstraint = webView.topAnchor.constraint(equalTo: topAnchor)
@@ -101,7 +102,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
 
         // Disables paginated mode if scroll is on.
         scrollView.isPagingEnabled = !viewModel.scroll
-        scrollView.isScrollEnabled = !viewModel.continuousScroll || !isContinuousPrepared
+        scrollView.isScrollEnabled = !viewModel.continuousScroll
 
         updateContentInset()
     }
@@ -306,6 +307,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
             return continuousProgression
         }
 
+        let wasPrepared = isContinuousPrepared
         let contentInset = scrollView.contentInset
         let result = await evaluateScript(
             "Math.max(document.scrollingElement ? document.scrollingElement.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)"
@@ -322,9 +324,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
             measuredHeight + contentInset.top + contentInset.bottom
         )
         continuousViewportHeight = viewportSize.height
-        updateContinuousProgression()
+        if !wasPrepared {
+            updateContinuousProgression()
+            resetContinuousInnerScrollPosition()
+        }
         isContinuousPrepared = true
-        resetContinuousInnerScrollPosition()
         scrollView.isScrollEnabled = false
         return continuousProgression
     }

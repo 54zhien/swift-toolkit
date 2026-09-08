@@ -168,6 +168,7 @@ final class PaginationView: UIView, Loggable {
     private var pendingContinuousProgression: Double?
     private var shouldApplyLoadedContinuousProgression = false
     private var isLayingOut = false
+    private var continuousLocationUpdateTask: Task<Void, Never>?
 
     /// Set while a transition animation is in progress to prevent
     /// `layoutSubviews` from resetting `contentOffset` and interrupting the
@@ -271,6 +272,7 @@ final class PaginationView: UIView, Loggable {
         super.willMove(toSuperview: newSuperview)
 
         if newSuperview == nil {
+            cancelContinuousLocationUpdate()
             // Remove all spread views to break retain cycles
             for (_, view) in loadedViews {
                 view.removeFromSuperview()
@@ -306,6 +308,7 @@ final class PaginationView: UIView, Loggable {
     func reloadAtIndex(_ index: Int, location: PageLocation, pageCount: Int, readingProgression: ReadingProgression) {
         precondition(pageCount >= 1)
         precondition(0 ..< pageCount ~= index)
+        cancelContinuousLocationUpdate()
 
         self.pageCount = pageCount
         self.readingProgression = readingProgression
@@ -326,6 +329,7 @@ final class PaginationView: UIView, Loggable {
     /// used when the EPUB scroll preference is submitted at runtime.
     func setLayoutMode(_ layoutMode: LayoutMode) {
         guard self.layoutMode != layoutMode else { return }
+        cancelContinuousLocationUpdate()
         self.layoutMode = layoutMode
         scrollView.isPagingEnabled = layoutMode == .horizontal
         scrollView.alwaysBounceVertical = layoutMode == .verticalContinuous
@@ -413,13 +417,11 @@ final class PaginationView: UIView, Loggable {
         if layoutMode == .verticalContinuous,
            let view = view as? ContinuousPageView {
             let progression = await view.prepareForContinuousLayout(viewportSize: scrollView.bounds.size)
-            pageHeights[index] = max(view.continuousContentHeight, scrollView.bounds.height)
+            updateContinuousPageHeight(at: index, height: view.continuousContentHeight)
             if index == currentIndex, shouldApplyLoadedContinuousProgression {
                 pendingContinuousProgression = progression
                 shouldApplyLoadedContinuousProgression = false
             }
-            setNeedsLayout()
-            layoutIfNeeded()
         }
         await loadNextPage()
     }
@@ -428,14 +430,19 @@ final class PaginationView: UIView, Loggable {
     /// the current page's visible anchor stable.
     func updateContinuousPageHeight(at index: Int, height: CGFloat) {
         guard layoutMode == .verticalContinuous else { return }
-        let oldOrigin = yOffsetForIndex(index, viewportHeight: scrollView.bounds.height)
+        let anchorIndex = continuousIndex(at: scrollView.contentOffset.y)
+        let oldOrigin = yOffsetForIndex(anchorIndex, viewportHeight: scrollView.bounds.height)
         let anchorOffset = scrollView.contentOffset.y - oldOrigin
-        pageHeights[index] = max(height, scrollView.bounds.height)
+        let resolvedHeight = max(height, scrollView.bounds.height)
+        guard abs((pageHeights[index] ?? scrollView.bounds.height) - resolvedHeight) > 0.5 else {
+            return
+        }
+        pageHeights[index] = resolvedHeight
         setNeedsLayout()
         layoutIfNeeded()
 
-        guard index <= currentIndex else { return }
-        let newOrigin = yOffsetForIndex(index, viewportHeight: scrollView.bounds.height)
+        guard index < anchorIndex else { return }
+        let newOrigin = yOffsetForIndex(anchorIndex, viewportHeight: scrollView.bounds.height)
         if !isLayingOut {
             scrollView.contentOffset.y = newOrigin + anchorOffset
         }
@@ -567,9 +574,12 @@ final class PaginationView: UIView, Loggable {
                         + CGFloat(progression.clamped(to: 0 ... 1))
                         * max(view.continuousContentHeight - scrollView.bounds.height, 0)
                 )
+                isAnimatingContentOffset = true
                 await animate(duration: 0.3) {
                     self.scrollView.contentOffset = target
                 }
+                isAnimatingContentOffset = false
+                updateContinuousIndexAndLocation()
             }
             return true
         }
@@ -698,7 +708,7 @@ extension PaginationView: UIScrollViewDelegate {
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         if layoutMode == .verticalContinuous {
-            delegate?.paginationViewDidUpdateViews(self)
+            updateContinuousIndexAndLocation()
             return
         }
         scrollView.isScrollEnabled = isScrollEnabled
@@ -706,6 +716,9 @@ extension PaginationView: UIScrollViewDelegate {
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         if layoutMode == .verticalContinuous {
+            if !decelerate {
+                updateContinuousIndexAndLocation()
+            }
             return
         }
         if !decelerate {
@@ -715,6 +728,7 @@ extension PaginationView: UIScrollViewDelegate {
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
         if layoutMode == .verticalContinuous {
+            updateContinuousIndexAndLocation()
             return
         }
         // A programmatic slide animation sets isScrollEnabled = false and drives the
@@ -733,11 +747,36 @@ extension PaginationView: UIScrollViewDelegate {
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard layoutMode == .verticalContinuous, !isLayingOut else { return }
+        guard layoutMode == .verticalContinuous, !isLayingOut, !isAnimatingContentOffset else { return }
+        let newIndex = continuousIndex(at: scrollView.contentOffset.y)
+        if newIndex != currentIndex {
+            setCurrentIndex(newIndex)
+        }
+        scheduleContinuousLocationUpdate()
+    }
+
+    private func scheduleContinuousLocationUpdate() {
+        guard continuousLocationUpdateTask == nil else { return }
+        continuousLocationUpdateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.continuousLocationUpdateTask = nil
+            guard self.layoutMode == .verticalContinuous else { return }
+            self.delegate?.paginationViewDidUpdateViews(self)
+        }
+    }
+
+    private func updateContinuousIndexAndLocation() {
+        cancelContinuousLocationUpdate()
         let newIndex = continuousIndex(at: scrollView.contentOffset.y)
         if newIndex != currentIndex {
             setCurrentIndex(newIndex)
         }
         delegate?.paginationViewDidUpdateViews(self)
+    }
+
+    private func cancelContinuousLocationUpdate() {
+        continuousLocationUpdateTask?.cancel()
+        continuousLocationUpdateTask = nil
     }
 }

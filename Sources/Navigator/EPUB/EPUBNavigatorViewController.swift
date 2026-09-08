@@ -423,6 +423,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var isPrewarmingAdjacentPages = false
     private var suppressLocationNotifications = false
     private var isPerformingAdjacentPageNavigation = false
+    private var continuousPageRemeasureTask: Task<Void, Never>?
+    private var pendingContinuousPageRemeasureSpread: EPUBSpreadView?
 
     /// Enables the navigator's built-in horizontal page-turn gestures.
     /// Clients rendering their own interactive transitions can disable this
@@ -1014,6 +1016,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
               adjacentPageTransaction == nil,
               !Task.isCancelled else { return }
 
+        if let preparedOrigin {
+            for direction in [NavigatorPageDirection.backward, .forward] {
+                guard let surface = adjacentPageCache[direction],
+                      !surface.origin.matchesAdjacentPageOrigin(preparedOrigin) else { continue }
+                surface.invalidate()
+                adjacentPageCache.removeValue(forKey: direction)
+                adjacentPageReadiness[direction] = .unknown
+            }
+        }
+
         if let currentLocation = preparedOrigin,
            let currentView = paginationView?.currentView as? EPUBSpreadView,
            currentView.isSpreadReady,
@@ -1083,7 +1095,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func preparedCurrentPageSurface() -> NavigatorCurrentPageSurface? {
-        preparedCurrentPageSurfaceCache
+        guard let surface = preparedCurrentPageSurfaceCache else { return nil }
+        if let currentLocation,
+           !currentLocation.matchesAdjacentPageOrigin(surface.identity.locator) {
+            return nil
+        }
+        return surface
     }
 
     public func preparedAdjacentPageSurface(
@@ -1094,6 +1111,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
               let surface = adjacentPageCache[direction],
               surface.isValid,
               surface.generation == adjacentPageGeneration else { return nil }
+        if let currentLocation,
+           !currentLocation.matchesAdjacentPageOrigin(surface.origin) {
+            return nil
+        }
         return surface
     }
 
@@ -1106,6 +1127,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
               surface.isValid,
               surface.generation == adjacentPageGeneration
         else {
+            return nil
+        }
+
+        if let currentLocation,
+           !currentLocation.matchesAdjacentPageOrigin(surface.origin) {
+            surface.invalidate()
+            adjacentPageReadiness[direction] = .unknown
             return nil
         }
 
@@ -2286,20 +2314,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 }
 
 private extension Locator {
-    /// WebKit can report tiny progression drift after restoring the same
-    /// reflowable page. Treat that as the same origin while still rejecting a
-    /// real navigation within the resource.
+    /// WebKit can report tiny floating-point progression drift after restoring
+    /// the same reflowable page. Keep the tolerance well below a real page
+    /// step; `position` is resource-level and can be shared by many pages.
     func matchesAdjacentPageOrigin(_ other: Locator) -> Bool {
         guard href == other.href else { return false }
-        if let position = locations.position, let otherPosition = other.locations.position {
-            return position == otherPosition
-        }
         if let progression = locations.progression,
            let otherProgression = other.locations.progression {
-            return abs(progression - otherProgression) <= 0.002
+            return abs(progression - otherProgression) <= 0.0001
         }
         if !locations.fragments.isEmpty || !other.locations.fragments.isEmpty {
             return locations.fragments == other.locations.fragments
+        }
+        if let position = locations.position, let otherPosition = other.locations.position {
+            return position == otherPosition
         }
         return self == other
     }
@@ -2564,8 +2592,42 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
+        if viewModel.continuousScroll {
+            scheduleContinuousPageRemeasure(for: spreadView)
+            return
+        }
         if paginationView?.currentView == spreadView {
             updateCurrentLocation()
+        }
+    }
+
+    private func scheduleContinuousPageRemeasure(for spreadView: EPUBSpreadView) {
+        pendingContinuousPageRemeasureSpread = spreadView
+        guard continuousPageRemeasureTask == nil else { return }
+
+        continuousPageRemeasureTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled,
+                  let spreadView = self.pendingContinuousPageRemeasureSpread {
+                self.pendingContinuousPageRemeasureSpread = nil
+                guard let paginationView = self.paginationView,
+                      let continuousView = spreadView as? ContinuousPageView,
+                      let index = paginationView.loadedViews.first(
+                          where: { $0.value === spreadView }
+                      )?.key else { continue }
+
+                _ = await continuousView.prepareForContinuousLayout(
+                    viewportSize: paginationView.bounds.size
+                )
+                guard !Task.isCancelled,
+                      paginationView.loadedViews[index] === spreadView else { continue }
+                paginationView.updateContinuousPageHeight(
+                    at: index,
+                    height: continuousView.continuousContentHeight
+                )
+                self.updateCurrentLocation()
+            }
+            self.continuousPageRemeasureTask = nil
         }
     }
 
