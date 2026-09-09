@@ -1541,7 +1541,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         view.addSubview(host)
 
         let renderer = makeSpreadView(for: spread, receivesNavigatorEvents: false)
-        if let currentView = paginationView?.currentView as? EPUBSpreadView {
+        if let currentView = paginationView.currentView as? EPUBSpreadView {
             renderer.surfaceContentInset = spreadViewContentInset(currentView)
         }
         renderer.frame = host.bounds
