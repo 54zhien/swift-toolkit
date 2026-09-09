@@ -181,33 +181,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
             return await super.go(to: direction, options: options)
         }
 
-        let factor: CGFloat = {
-            switch direction {
-            case .left:
-                return -1
-            case .right:
-                return 1
-            }
-        }()
+        // Let the page script own the horizontal coordinate system. UIKit's
+        // UIScrollView normalizes RTL offsets to non-negative values while
+        // WebKit's scrolling element can use negative scrollX values. The
+        // script's scrollLeft/scrollRight helpers already clamp both models
+        // and return whether a page was actually moved.
+        let directionName = direction == .left ? "Left" : "Right"
+        let dir = viewModel.readingProgression.rawValue
+        let animated = options.animated ? "true" : "false"
+        let result = await evaluateScript("readium.scroll\(directionName)('\(dir)', \(animated));")
 
-        guard scrollView.bounds.width > 0 else { return false }
-        let offsetX = scrollView.bounds.width * factor
-        let targetX = round((scrollView.contentOffset.x + offsetX) / offsetX) * offsetX
-        guard 0 ..< scrollView.contentSize.width ~= targetX else {
+        guard case let .success(value) = result,
+              (value as? Bool) == true else {
             return false
         }
-
-        // We use JavaScript instead of `UIScrollView.setContentOffset()` to
-        // prevent glitches when turning pages without animation.
-        // See https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
-        //
-        // `scrollBy` is used instead of `scrollTo` because RTL content uses
-        // negative `window.scrollX` values in WKWebView, whereas UIKit's
-        // `contentOffset.x` is always non-negative. A relative displacement
-        // (`offsetX`) is coordinate-system agnostic and works for both LTR and
-        // RTL.
-        let behavior = options.animated ? "smooth" : "instant"
-        await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });")
 
         if options.animated {
             // Waits for the scroll animation to finish.

@@ -424,7 +424,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var suppressLocationNotifications = false
     private var isPerformingAdjacentPageNavigation = false
     private var continuousPageRemeasureTask: Task<Void, Never>?
-    private var pendingContinuousPageRemeasureSpread: EPUBSpreadView?
+    private var continuousPageRemeasureToken: UUID?
+    private var continuousPageRemeasureGeneration = 0
+    private var pendingContinuousPageRemeasureSpreads: [ObjectIdentifier: EPUBSpreadView] = [:]
 
     /// Enables the navigator's built-in horizontal page-turn gestures.
     /// Clients rendering their own interactive transitions can disable this
@@ -690,8 +692,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Goes to the next or previous page in the given scroll direction.
     private func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
+        await go(
+            to: direction,
+            options: options,
+            allowAdjacentPageTransaction: false
+        )
+    }
+
+    private func go(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions,
+        allowAdjacentPageTransaction: Bool
+    ) async -> Bool {
         guard
             let paginationView = paginationView,
+            (allowAdjacentPageTransaction
+                ? adjacentPageTransaction != nil && isPerformingAdjacentPageNavigation
+                : adjacentPageTransaction == nil),
             on(.move(direction))
         else {
             return false
@@ -779,6 +796,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func _reloadSpreads() {
+        cancelContinuousPageRemeasure()
         invalidateAdjacentPageSurfaces()
         let locator = currentLocation
 
@@ -1205,11 +1223,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // moving the visible navigator back and forth. The same mechanism also
         // handles a preloaded-but-not-yet-loaded cross-resource spread.
         if reflowHasPageInCurrentResource,
-           let currentView = paginationView?.currentView as? EPUBReflowableSpreadView,
-           let renderer = await makeDetachedSpreadRenderer(
-               spread: currentView.spread,
-               location: .locator(origin)
-           ),
+            let currentView = paginationView?.currentView as? EPUBReflowableSpreadView,
+            let renderer = await makeDetachedSpreadRenderer(
+                spread: currentView.spread,
+                location: .locator(origin),
+                generation: generation
+            ),
            let reflowRenderer = renderer as? EPUBReflowableSpreadView
         {
             defer {
@@ -1251,7 +1270,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // navigator. Render the target spread directly in a detached view.
         if let renderer = await makeDetachedSpreadRenderer(
             spread: spreads[targetIndex],
-            location: direction == .forward ? .start : .end
+            location: direction == .forward ? .start : .end,
+            generation: generation
         ) {
             defer {
                 renderer.clear()
@@ -1500,9 +1520,22 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         spreadView.convert(spreadView.webView.bounds, from: spreadView.webView)
     }
 
-    private func makeDetachedSpreadRenderer(spread: EPUBSpread, location: PageLocation) async -> EPUBSpreadView? {
-        guard !Task.isCancelled else { return nil }
-        let host = UIView(frame: CGRect(x: -20000, y: -20000, width: view.bounds.width, height: view.bounds.height))
+    private func makeDetachedSpreadRenderer(
+        spread: EPUBSpread,
+        location: PageLocation,
+        generation: Int
+    ) async -> EPUBSpreadView? {
+        guard generation == adjacentPageGeneration,
+              !Task.isCancelled,
+              let paginationView,
+              paginationView.bounds.width > 0,
+              paginationView.bounds.height > 0 else { return nil }
+
+        paginationView.layoutIfNeeded()
+        let viewportSize = paginationView.bounds.size
+        guard viewportSize.width > 0, viewportSize.height > 0 else { return nil }
+
+        let host = UIView(frame: CGRect(x: -20000, y: -20000, width: viewportSize.width, height: viewportSize.height))
         host.isUserInteractionEnabled = false
         host.backgroundColor = .clear
         view.addSubview(host)
@@ -1516,13 +1549,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         host.addSubview(renderer)
         renderer.layoutIfNeeded()
 
-        guard await waitForSpreadLoaded(renderer) else {
+        guard generation == adjacentPageGeneration,
+              viewportSizeApproximatelyMatches(paginationView.bounds.size, viewportSize),
+              await waitForSpreadLoaded(renderer) else {
             renderer.clear()
             renderer.removeFromSuperview()
             host.removeFromSuperview()
             return nil
         }
-        guard !Task.isCancelled else {
+        guard generation == adjacentPageGeneration,
+              viewportSizeApproximatelyMatches(paginationView.bounds.size, viewportSize),
+              !Task.isCancelled else {
             renderer.clear()
             renderer.removeFromSuperview()
             host.removeFromSuperview()
@@ -1537,6 +1574,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         host.accessibilityElementsHidden = true
         return renderer
+    }
+
+    private func viewportSizeApproximatelyMatches(_ lhs: CGSize, _ rhs: CGSize) -> Bool {
+        abs(lhs.width - rhs.width) <= 0.5 && abs(lhs.height - rhs.height) <= 0.5
     }
 
     private func waitForSpreadLoaded(_ spreadView: EPUBSpreadView) async -> Bool {
@@ -1671,8 +1712,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         suppressLocationNotifications = true
         isPerformingAdjacentPageNavigation = true
+        let visualDirection: EPUBSpreadView.Direction = {
+            switch (activeSurface.direction, viewModel.readingProgression) {
+            case (.forward, .ltr), (.backward, .rtl):
+                return .right
+            case (.forward, .rtl), (.backward, .ltr):
+                return .left
+            }
+        }()
         let moved = await go(
-            to: activeSurface.locator,
+            to: visualDirection,
             options: .none,
             allowAdjacentPageTransaction: true
         )
@@ -2602,14 +2651,18 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     private func scheduleContinuousPageRemeasure(for spreadView: EPUBSpreadView) {
-        pendingContinuousPageRemeasureSpread = spreadView
+        pendingContinuousPageRemeasureSpreads[ObjectIdentifier(spreadView)] = spreadView
         guard continuousPageRemeasureTask == nil else { return }
 
+        let generation = continuousPageRemeasureGeneration
+        let token = UUID()
+        continuousPageRemeasureToken = token
         continuousPageRemeasureTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while !Task.isCancelled,
-                  let spreadView = self.pendingContinuousPageRemeasureSpread {
-                self.pendingContinuousPageRemeasureSpread = nil
+                  generation == self.continuousPageRemeasureGeneration,
+                  let (id, spreadView) = self.pendingContinuousPageRemeasureSpreads.first {
+                self.pendingContinuousPageRemeasureSpreads.removeValue(forKey: id)
                 guard let paginationView = self.paginationView,
                       let continuousView = spreadView as? ContinuousPageView,
                       let index = paginationView.loadedViews.first(
@@ -2620,6 +2673,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
                     viewportSize: paginationView.bounds.size
                 )
                 guard !Task.isCancelled,
+                      generation == self.continuousPageRemeasureGeneration,
                       paginationView.loadedViews[index] === spreadView else { continue }
                 paginationView.updateContinuousPageHeight(
                     at: index,
@@ -2627,8 +2681,19 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
                 )
                 self.updateCurrentLocation()
             }
-            self.continuousPageRemeasureTask = nil
+            if self.continuousPageRemeasureToken == token {
+                self.continuousPageRemeasureToken = nil
+                self.continuousPageRemeasureTask = nil
+            }
         }
+    }
+
+    private func cancelContinuousPageRemeasure() {
+        continuousPageRemeasureGeneration &+= 1
+        pendingContinuousPageRemeasureSpreads.removeAll()
+        continuousPageRemeasureToken = nil
+        continuousPageRemeasureTask?.cancel()
+        continuousPageRemeasureTask = nil
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController) {

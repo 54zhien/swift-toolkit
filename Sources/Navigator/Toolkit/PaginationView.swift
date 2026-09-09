@@ -168,7 +168,9 @@ final class PaginationView: UIView, Loggable {
     private var pendingContinuousProgression: Double?
     private var shouldApplyLoadedContinuousProgression = false
     private var isLayingOut = false
+    private var layoutGeneration = 0
     private var continuousLocationUpdateTask: Task<Void, Never>?
+    private var isRestoringContinuousAnchor = false
 
     /// Set while a transition animation is in progress to prevent
     /// `layoutSubviews` from resetting `contentOffset` and interrupting the
@@ -273,6 +275,9 @@ final class PaginationView: UIView, Loggable {
 
         if newSuperview == nil {
             cancelContinuousLocationUpdate()
+            layoutGeneration &+= 1
+            loadingIndexQueue.removeAll()
+            loadPagesTask?.cancel()
             // Remove all spread views to break retain cycles
             for (_, view) in loadedViews {
                 view.removeFromSuperview()
@@ -309,6 +314,8 @@ final class PaginationView: UIView, Loggable {
         precondition(pageCount >= 1)
         precondition(0 ..< pageCount ~= index)
         cancelContinuousLocationUpdate()
+        layoutGeneration &+= 1
+        loadPagesTask?.cancel()
 
         self.pageCount = pageCount
         self.readingProgression = readingProgression
@@ -330,6 +337,9 @@ final class PaginationView: UIView, Loggable {
     func setLayoutMode(_ layoutMode: LayoutMode) {
         guard self.layoutMode != layoutMode else { return }
         cancelContinuousLocationUpdate()
+        self.layoutGeneration &+= 1
+        loadPagesTask?.cancel()
+        loadingIndexQueue.removeAll()
         self.layoutMode = layoutMode
         scrollView.isPagingEnabled = layoutMode == .horizontal
         scrollView.alwaysBounceVertical = layoutMode == .verticalContinuous
@@ -387,15 +397,17 @@ final class PaginationView: UIView, Loggable {
     }
 
     private func loadPages() {
+        let generation = layoutGeneration
         loadPagesTask.replace { @MainActor in
-            await loadNextPage()
+            await loadNextPage(generation: generation)
             delegate?.paginationViewDidUpdateViews(self)
         }
     }
 
     private var loadPagesTask: Task<Void, Never>?
 
-    private func loadNextPage() async {
+    private func loadNextPage(generation: Int) async {
+        guard generation == layoutGeneration, !Task.isCancelled else { return }
         guard let (index, location) = loadingIndexQueue.popFirst() else {
             return
         }
@@ -414,16 +426,19 @@ final class PaginationView: UIView, Loggable {
         }
 
         await view.go(to: location, animated: false)
+        guard generation == layoutGeneration, !Task.isCancelled else { return }
         if layoutMode == .verticalContinuous,
            let view = view as? ContinuousPageView {
             let progression = await view.prepareForContinuousLayout(viewportSize: scrollView.bounds.size)
+            guard generation == layoutGeneration, !Task.isCancelled else { return }
             updateContinuousPageHeight(at: index, height: view.continuousContentHeight)
             if index == currentIndex, shouldApplyLoadedContinuousProgression {
                 pendingContinuousProgression = progression
                 shouldApplyLoadedContinuousProgression = false
             }
         }
-        await loadNextPage()
+        guard generation == layoutGeneration, !Task.isCancelled else { return }
+        await loadNextPage(generation: generation)
     }
 
     /// Updates the measured height of a loaded continuous page while keeping
@@ -432,7 +447,11 @@ final class PaginationView: UIView, Loggable {
         guard layoutMode == .verticalContinuous else { return }
         let anchorIndex = continuousIndex(at: scrollView.contentOffset.y)
         let oldOrigin = yOffsetForIndex(anchorIndex, viewportHeight: scrollView.bounds.height)
-        let anchorOffset = scrollView.contentOffset.y - oldOrigin
+        let oldHeight = pageHeight(for: anchorIndex, viewportHeight: scrollView.bounds.height)
+        let oldScrollableHeight = max(oldHeight - scrollView.bounds.height, 0)
+        let anchorProgression = oldScrollableHeight > 0
+            ? ((scrollView.contentOffset.y - oldOrigin) / oldScrollableHeight).clamped(to: 0 ... 1)
+            : 0
         let resolvedHeight = max(height, scrollView.bounds.height)
         guard abs((pageHeights[index] ?? scrollView.bounds.height) - resolvedHeight) > 0.5 else {
             return
@@ -441,11 +460,15 @@ final class PaginationView: UIView, Loggable {
         setNeedsLayout()
         layoutIfNeeded()
 
-        guard index < anchorIndex else { return }
         let newOrigin = yOffsetForIndex(anchorIndex, viewportHeight: scrollView.bounds.height)
-        if !isLayingOut {
-            scrollView.contentOffset.y = newOrigin + anchorOffset
-        }
+        let newHeight = pageHeight(for: anchorIndex, viewportHeight: scrollView.bounds.height)
+        let newScrollableHeight = max(newHeight - scrollView.bounds.height, 0)
+        let newOffset = newOrigin + anchorProgression * newScrollableHeight
+        guard abs(scrollView.contentOffset.y - newOffset) > 0.5 else { return }
+
+        isRestoringContinuousAnchor = true
+        scrollView.contentOffset.y = newOffset
+        isRestoringContinuousAnchor = false
     }
 
     private func locationProgression(_ location: PageLocation) -> Double? {
@@ -747,7 +770,10 @@ extension PaginationView: UIScrollViewDelegate {
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard layoutMode == .verticalContinuous, !isLayingOut, !isAnimatingContentOffset else { return }
+        guard layoutMode == .verticalContinuous,
+              !isLayingOut,
+              !isAnimatingContentOffset,
+              !isRestoringContinuousAnchor else { return }
         let newIndex = continuousIndex(at: scrollView.contentOffset.y)
         if newIndex != currentIndex {
             setCurrentIndex(newIndex)
