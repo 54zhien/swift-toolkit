@@ -857,12 +857,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             && !(config.disablePageTurnsWhileScrolling && settings.scroll && !isContinuousScrollEnabled)
     }
 
-    /// Continuous mode is deliberately opt-in and only applies to reflowable
-    /// EPUBs. Fixed-layout publications retain their existing pagination.
+    /// Continuous mode is deliberately opt-in and only applies to horizontal
+    /// reflowable EPUBs. Fixed-layout and vertical-writing publications retain
+    /// their native horizontal presentation.
     public var isContinuousScrollEnabled: Bool {
         config.continuousScroll
             && settings.scroll
             && publication.metadata.epubLayout == .reflowable
+            && !settings.verticalText
     }
 
     private func updatePageTurnInteraction() {

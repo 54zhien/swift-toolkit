@@ -262,6 +262,7 @@ enum EPUBScriptScope {
         config.continuousScroll
             && settings.scroll
             && publication.metadata.epubLayout == .reflowable
+            && !settings.verticalText
     }
 
     var verticalText: Bool {
