@@ -383,7 +383,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             case .initializing, .loading, .jumping, .moving:
                 paginationView?.isUserInteractionEnabled = false
             case .idle:
-                paginationView?.isUserInteractionEnabled = true
+                paginationView?.isUserInteractionEnabled = isUserPageTurnInteractionEnabled
             }
         }
     }
@@ -420,7 +420,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         .backward: .unknown,
         .forward: .unknown,
     ]
-    private var isPrewarmingAdjacentPages = false
+    private var adjacentPagePrewarmToken: UUID?
     private var suppressLocationNotifications = false
     private var isPerformingAdjacentPageNavigation = false
     private var continuousPageRemeasureTask: Task<Void, Never>?
@@ -869,10 +869,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func updatePageTurnInteraction() {
         paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
-        guard !settings.scroll else { return }
         guard let loadedViews = paginationView?.loadedViews else { return }
         for case let spreadView as EPUBSpreadView in loadedViews.values {
-            spreadView.webView.scrollView.isScrollEnabled = isUserPageTurnInteractionEnabled
+            spreadView.isUserPageTurnInteractionEnabled = isUserPageTurnInteractionEnabled
         }
     }
 
@@ -1010,17 +1009,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     // MARK: - Adjacent page surfaces
 
     public func prewarmAdjacentPageSurfaces(preferredDirection: NavigatorPageDirection) async {
-        guard !isPrewarmingAdjacentPages, state == .idle, adjacentPageTransaction == nil else {
+        guard adjacentPagePrewarmToken == nil, state == .idle, adjacentPageTransaction == nil else {
             return
         }
 
-        await initialized()
-        guard state == .idle, !Task.isCancelled else { return }
-
-        isPrewarmingAdjacentPages = true
+        let prewarmToken = UUID()
+        adjacentPagePrewarmToken = prewarmToken
         let prewarmEpoch = adjacentPageGeneration
+        let prewarmDeadline = adjacentPageDeadline(after: 3_000_000_000)
         defer {
-            isPrewarmingAdjacentPages = false
+            guard adjacentPagePrewarmToken == prewarmToken else { return }
+            adjacentPagePrewarmToken = nil
             if prewarmEpoch == adjacentPageGeneration {
                 for direction in [NavigatorPageDirection.backward, .forward]
                     where adjacentPageReadiness[direction] == .preparing
@@ -1030,11 +1029,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }
 
-        let preparedOrigin = (await computeCurrentLocationAndViewport()).0
-        guard prewarmEpoch == adjacentPageGeneration,
+        await initialized()
+        guard adjacentPagePrewarmToken == prewarmToken,
+              state == .idle,
+              !Task.isCancelled,
+              DispatchTime.now().uptimeNanoseconds < prewarmDeadline else { return }
+
+        let preparedOrigin = (await computeCurrentLocationAndViewport(deadline: prewarmDeadline)).0
+        guard adjacentPagePrewarmToken == prewarmToken,
+              prewarmEpoch == adjacentPageGeneration,
               state == .idle,
               adjacentPageTransaction == nil,
-              !Task.isCancelled else { return }
+              !Task.isCancelled,
+              DispatchTime.now().uptimeNanoseconds < prewarmDeadline else { return }
 
         if let preparedOrigin {
             for direction in [NavigatorPageDirection.backward, .forward] {
@@ -1049,7 +1056,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if let currentLocation = preparedOrigin,
            let currentView = paginationView?.currentView as? EPUBSpreadView,
            currentView.isSpreadReady,
-           let image = await stableSnapshot(of: currentView),
+           let image = await stableSnapshot(of: currentView, deadline: prewarmDeadline),
+           adjacentPagePrewarmToken == prewarmToken,
            prewarmEpoch == adjacentPageGeneration,
            !Task.isCancelled
         {
@@ -1071,10 +1079,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // it never moves the visible navigator.
         let opposite: NavigatorPageDirection = preferredDirection == .forward ? .backward : .forward
         for direction in [preferredDirection, opposite] {
-            guard prewarmEpoch == adjacentPageGeneration,
+            guard adjacentPagePrewarmToken == prewarmToken,
+                  prewarmEpoch == adjacentPageGeneration,
                   state == .idle,
                   adjacentPageTransaction == nil,
-                  !Task.isCancelled else { return }
+                  !Task.isCancelled,
+                  DispatchTime.now().uptimeNanoseconds < prewarmDeadline else { return }
             if let surface = adjacentPageCache[direction], surface.isValid {
                 adjacentPageReadiness[direction] = .ready
                 continue
@@ -1090,12 +1100,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let result = await buildAdjacentPageSurface(
                 direction: direction,
                 origin: preparedOrigin,
-                generation: prewarmEpoch
+                generation: prewarmEpoch,
+                deadline: prewarmDeadline
             )
-            guard prewarmEpoch == adjacentPageGeneration,
+            guard adjacentPagePrewarmToken == prewarmToken,
+                  prewarmEpoch == adjacentPageGeneration,
                   state == .idle,
                   adjacentPageTransaction == nil,
-                  !Task.isCancelled else { return }
+                  !Task.isCancelled,
+                  DispatchTime.now().uptimeNanoseconds < prewarmDeadline else { return }
             if let surface = result.surface {
                 guard surface.generation == adjacentPageGeneration else {
                     surface.invalidate()
@@ -1176,9 +1189,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func buildAdjacentPageSurface(
         direction: NavigatorPageDirection,
         origin: Locator,
-        generation: Int
+        generation: Int,
+        deadline: UInt64
     ) async -> AdjacentSurfaceBuildResult {
-        guard state == .idle, adjacentPageTransaction == nil else {
+        guard state == .idle,
+              adjacentPageTransaction == nil,
+              DispatchTime.now().uptimeNanoseconds < deadline else {
             return .init(surface: nil, readiness: .unknown)
         }
 
@@ -1187,7 +1203,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let reflowHasPageInCurrentResource = await currentReflowPageAvailable(
             direction: direction,
             origin: origin,
-            generation: generation
+            generation: generation,
+            deadline: deadline
         ) else {
             // A reflow spread with no trustworthy progression must not be
             // treated as exhausted: doing so could incorrectly cross into the
@@ -1200,12 +1217,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // current resource is at its end. This is safe because it is off-screen
         // and has no effect on currentIndex or the visible WebView.
         if !reflowHasPageInCurrentResource,
-           let targetView = loadedAdjacentSpreadView(direction: direction),
-           targetView.isSpreadReady,
-           let image = await stableSnapshot(of: targetView),
-           let target = await targetLocator(for: targetView, direction: direction, generation: generation),
-           generation == adjacentPageGeneration,
-           !Task.isCancelled
+            let targetView = loadedAdjacentSpreadView(direction: direction),
+            targetView.isSpreadReady,
+            let image = await stableSnapshot(of: targetView, deadline: deadline),
+            let target = await targetLocator(
+                for: targetView,
+                direction: direction,
+                generation: generation,
+                deadline: deadline
+            ),
+            generation == adjacentPageGeneration,
+            !Task.isCancelled,
+            DispatchTime.now().uptimeNanoseconds < deadline
         {
             return .init(surface: NavigatorPageSurface(
                 direction: direction,
@@ -1229,7 +1252,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let renderer = await makeDetachedSpreadRenderer(
                 spread: currentView.spread,
                 location: .locator(origin),
-                generation: generation
+                generation: generation,
+                deadline: deadline
             ),
            let reflowRenderer = renderer as? EPUBReflowableSpreadView
         {
@@ -1237,10 +1261,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 renderer.clear()
                 renderer.superview?.removeFromSuperview()
             }
-            if let image = await renderAdjacentPage(in: reflowRenderer, direction: direction),
-               let target = await targetLocator(for: reflowRenderer, direction: direction, generation: generation),
+            if let image = await renderAdjacentPage(
+                in: reflowRenderer,
+                direction: direction,
+                deadline: deadline
+            ),
+               let target = await targetLocator(
+                   for: reflowRenderer,
+                   direction: direction,
+                   generation: generation,
+                   deadline: deadline
+               ),
                generation == adjacentPageGeneration,
-               !Task.isCancelled
+               !Task.isCancelled,
+               DispatchTime.now().uptimeNanoseconds < deadline
             {
                 return .init(surface: NavigatorPageSurface(
                     direction: direction,
@@ -1273,16 +1307,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if let renderer = await makeDetachedSpreadRenderer(
             spread: spreads[targetIndex],
             location: direction == .forward ? .start : .end,
-            generation: generation
+            generation: generation,
+            deadline: deadline
         ) {
             defer {
                 renderer.clear()
                 renderer.superview?.removeFromSuperview()
             }
-            if let image = await stableSnapshot(of: renderer),
-               let target = await targetLocator(for: renderer, direction: direction, generation: generation),
+            if let image = await stableSnapshot(of: renderer, deadline: deadline),
+               let target = await targetLocator(
+                   for: renderer,
+                   direction: direction,
+                   generation: generation,
+                   deadline: deadline
+               ),
                generation == adjacentPageGeneration,
-               !Task.isCancelled
+               !Task.isCancelled,
+               DispatchTime.now().uptimeNanoseconds < deadline
             {
                 return .init(surface: NavigatorPageSurface(
                     direction: direction,
@@ -1320,14 +1361,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func currentReflowPageAvailable(
         direction: NavigatorPageDirection,
         origin: Locator,
-        generation: Int
+        generation: Int,
+        deadline: UInt64
     ) async -> Bool? {
         guard !settings.scroll else { return false }
         guard let currentView = paginationView?.currentView else { return nil }
         guard let reflow = currentView as? EPUBReflowableSpreadView else { return false }
 
         for _ in 0..<90 {
-            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+            guard generation == adjacentPageGeneration,
+                  !Task.isCancelled,
+                  DispatchTime.now().uptimeNanoseconds < deadline else { return nil }
 
             if reflow.isSpreadReady {
                 if let range = reflow.currentProgression {
@@ -1358,7 +1402,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 }
             }
 
-            try? await Task.sleep(nanoseconds: 16_000_000)
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return nil }
+            try? await Task.sleep(nanoseconds: min(16_000_000, deadline - now))
         }
         return nil
     }
@@ -1366,13 +1412,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func targetLocator(
         for spreadView: EPUBSpreadView,
         direction: NavigatorPageDirection,
-        generation: Int
+        generation: Int,
+        deadline: UInt64
     ) async -> AdjacentSurfaceTarget? {
         // FXL pages are leaf resources. The surface still represents the
         // complete spread in this phase, but its transaction identity must
         // point at the actual leaf entering from the requested side.
         if publication.metadata.layout == .fixed {
-            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+            guard generation == adjacentPageGeneration,
+                  !Task.isCancelled,
+                  DispatchTime.now().uptimeNanoseconds < deadline else { return nil }
             let leaf = fixedLeaf(for: spreadView.spread, direction: direction)
             let locator = Locator(
                 href: leaf.link.url(),
@@ -1387,16 +1436,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         guard let reflow = spreadView as? EPUBReflowableSpreadView,
-              let reflowProgression = await waitForPublishedProgression(
-                  in: reflow,
-                  generation: generation
-              ),
-              generation == adjacentPageGeneration,
-              !Task.isCancelled
+               let reflowProgression = await waitForPublishedProgression(
+                   in: reflow,
+                   generation: generation,
+                   deadline: deadline
+               ),
+               generation == adjacentPageGeneration,
+               !Task.isCancelled,
+               DispatchTime.now().uptimeNanoseconds < deadline
         else { return nil }
 
         if let locator = await spreadView.findFirstVisibleElementLocator() {
-            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+            guard generation == adjacentPageGeneration,
+                  !Task.isCancelled,
+                  DispatchTime.now().uptimeNanoseconds < deadline else { return nil }
             let locator = locator.copy(locations: { $0.progression = reflowProgression })
             return makeSurfaceTarget(locator: locator, in: spreadView.spread)
         }
@@ -1412,18 +1465,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func waitForPublishedProgression(
         in spreadView: EPUBReflowableSpreadView,
-        generation: Int
+        generation: Int,
+        deadline: UInt64
     ) async -> Double? {
         // isSpreadReady can precede the progressionChanged message by a few
         // frames on a newly detached WebView. Wait for the real value instead
         // of manufacturing 0, while making every exit cancellation- and
         // generation-safe.
         for _ in 0..<90 {
-            guard generation == adjacentPageGeneration, !Task.isCancelled else { return nil }
+            guard generation == adjacentPageGeneration,
+                  !Task.isCancelled,
+                  DispatchTime.now().uptimeNanoseconds < deadline else { return nil }
             if let progression = spreadView.currentProgression {
                 return progression.lowerBound
             }
-            try? await Task.sleep(nanoseconds: 16_000_000)
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return nil }
+            try? await Task.sleep(nanoseconds: min(16_000_000, deadline - now))
         }
         return nil
     }
@@ -1525,10 +1583,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func makeDetachedSpreadRenderer(
         spread: EPUBSpread,
         location: PageLocation,
-        generation: Int
+        generation: Int,
+        deadline: UInt64
     ) async -> EPUBSpreadView? {
         guard generation == adjacentPageGeneration,
               !Task.isCancelled,
+              DispatchTime.now().uptimeNanoseconds < deadline,
               let paginationView,
               paginationView.bounds.width > 0,
               paginationView.bounds.height > 0 else { return nil }
@@ -1553,7 +1613,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         guard generation == adjacentPageGeneration,
               viewportSizeApproximatelyMatches(paginationView.bounds.size, viewportSize),
-              await waitForSpreadLoaded(renderer) else {
+              await waitForSpreadLoaded(renderer, deadline: deadline) else {
             renderer.clear()
             renderer.removeFromSuperview()
             host.removeFromSuperview()
@@ -1561,14 +1621,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         guard generation == adjacentPageGeneration,
               viewportSizeApproximatelyMatches(paginationView.bounds.size, viewportSize),
-              !Task.isCancelled else {
+              !Task.isCancelled,
+              DispatchTime.now().uptimeNanoseconds < deadline else {
             renderer.clear()
             renderer.removeFromSuperview()
             host.removeFromSuperview()
             return nil
         }
         await renderer.go(to: location, animated: false)
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              generation == adjacentPageGeneration,
+              DispatchTime.now().uptimeNanoseconds < deadline else {
             renderer.clear()
             renderer.removeFromSuperview()
             host.removeFromSuperview()
@@ -1582,22 +1645,24 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         abs(lhs.width - rhs.width) <= 0.5 && abs(lhs.height - rhs.height) <= 0.5
     }
 
-    private func waitForSpreadLoaded(_ spreadView: EPUBSpreadView) async -> Bool {
+    private func waitForSpreadLoaded(_ spreadView: EPUBSpreadView, deadline: UInt64) async -> Bool {
         // Do not await EPUBSpreadView.spreadLoaded() here: it is backed by a
         // continuation and cannot be safely cancelled while a detached WebKit
         // process is being torn down. Polling gives both cancellation and a
         // bounded cleanup path.
         for _ in 0..<120 {
             if spreadView.isSpreadReady { return true }
-            if Task.isCancelled { return false }
-            try? await Task.sleep(nanoseconds: 16_000_000)
+            guard !Task.isCancelled else { return false }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return false }
+            try? await Task.sleep(nanoseconds: min(16_000_000, deadline - now))
         }
         return false
     }
 
-    private func stableSnapshot(of spreadView: EPUBSpreadView) async -> UIImage? {
-        let deadline = DispatchTime.now().uptimeNanoseconds + 750_000_000
+    private func stableSnapshot(of spreadView: EPUBSpreadView, deadline: UInt64) async -> UIImage? {
         guard spreadView.isSpreadReady,
+              deadline > DispatchTime.now().uptimeNanoseconds,
               await waitForStablePaint(of: spreadView, deadline: deadline),
               !Task.isCancelled
         else { return nil }
@@ -1619,7 +1684,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         })
     }
 
-    private func renderAdjacentPage(in renderer: EPUBReflowableSpreadView, direction: NavigatorPageDirection) async -> UIImage? {
+    private func renderAdjacentPage(
+        in renderer: EPUBReflowableSpreadView,
+        direction: NavigatorPageDirection,
+        deadline: UInt64
+    ) async -> UIImage? {
+        guard deadline > DispatchTime.now().uptimeNanoseconds else { return nil }
         let visualDirection: EPUBSpreadView.Direction = direction == .forward
             ? (viewModel.readingProgression == .rtl ? .left : .right)
             : (viewModel.readingProgression == .rtl ? .right : .left)
@@ -1630,15 +1700,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // The renderer must publish a new progression after the detached go.
         // Merely waiting a fixed duration would allow a delayed callback to
         // leave the surface identified by the origin page.
-        guard await waitForReflowProgressionChange(renderer, from: previousProgression) else {
+        guard await waitForReflowProgressionChange(
+            renderer,
+            from: previousProgression,
+            deadline: deadline
+        ) else {
             return nil
         }
-        return await stableSnapshot(of: renderer)
+        return await stableSnapshot(of: renderer, deadline: deadline)
     }
 
     private func waitForReflowProgressionChange(
         _ renderer: EPUBReflowableSpreadView,
-        from previous: ClosedRange<Double>?
+        from previous: ClosedRange<Double>?,
+        deadline: UInt64
     ) async -> Bool {
         for _ in 0..<90 {
             if let progression = renderer.currentProgression,
@@ -1646,8 +1721,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             {
                 return true
             }
-            if Task.isCancelled { return false }
-            try? await Task.sleep(nanoseconds: 16_000_000)
+            guard !Task.isCancelled else { return false }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return false }
+            try? await Task.sleep(nanoseconds: min(16_000_000, deadline - now))
         }
         return false
     }
@@ -2750,9 +2827,8 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         if receivesNavigatorEvents {
             spreadView.delegate = self
         }
-        if !settings.scroll {
-            spreadView.webView.scrollView.isScrollEnabled = receivesNavigatorEvents && isUserPageTurnInteractionEnabled
-        }
+        spreadView.isUserPageTurnInteractionEnabled =
+            receivesNavigatorEvents && isUserPageTurnInteractionEnabled
 
         return spreadView
     }

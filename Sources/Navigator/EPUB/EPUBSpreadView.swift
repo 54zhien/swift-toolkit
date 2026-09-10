@@ -135,6 +135,15 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// send navigator callbacks or alter the visible spread.
     var surfaceContentInset: UIEdgeInsets?
 
+    /// Controls whether this spread may accept the navigator's user page-turn
+    /// interaction. Programmatic positioning remains available when this is
+    /// false; subclasses may add a short-lived programmatic override.
+    var isUserPageTurnInteractionEnabled = true {
+        didSet {
+            applyUserPageTurnInteraction()
+        }
+    }
+
     required init(
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread,
@@ -211,6 +220,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         // Prevents the pages from jumping down when the status bar is toggled
         scrollView.contentInsetAdjustmentBehavior = .never
 
+        applyUserPageTurnInteraction()
+
         webView.navigationDelegate = self
         webView.uiDelegate = self
         scrollView.delegate = self
@@ -223,6 +234,12 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     var scrollView: UIScrollView {
         webView.scrollView
+    }
+
+    /// Applies the persistent user-interaction policy without preventing
+    /// programmatic content-offset or WebKit positioning.
+    func applyUserPageTurnInteraction() {
+        scrollView.isScrollEnabled = isUserPageTurnInteractionEnabled
     }
 
     override func willMove(toSuperview newSuperview: UIView?) {

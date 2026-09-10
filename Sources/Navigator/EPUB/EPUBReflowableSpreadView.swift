@@ -21,6 +21,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
     private(set) var continuousProgression: Double = 0
     private var isContinuousPrepared = false
     private var continuousViewportHeight: CGFloat = 0
+    private var isProgrammaticInnerScrollEnabled = false {
+        didSet {
+            applyUserPageTurnInteraction()
+        }
+    }
 
     required init(
         viewModel: EPUBNavigatorViewModel,
@@ -64,7 +69,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
         // owner. Programmatic positioning continues to work while user
         // scrolling is disabled, so there is no need for two competing pans
         // during the initial measurement window.
-        scrollView.isScrollEnabled = !viewModel.continuousScroll
+        applyUserPageTurnInteraction()
 
         webView.translatesAutoresizingMaskIntoConstraints = false
         topConstraint = webView.topAnchor.constraint(equalTo: topAnchor)
@@ -102,7 +107,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
 
         // Disables paginated mode if scroll is on.
         scrollView.isPagingEnabled = !viewModel.scroll
-        scrollView.isScrollEnabled = !viewModel.continuousScroll
+        applyUserPageTurnInteraction()
 
         updateContentInset()
     }
@@ -264,7 +269,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
                 return
             }
 
-            scrollView.isScrollEnabled = true
+            isProgrammaticInnerScrollEnabled = true
+        }
+
+        defer {
+            guard wasContinuousPrepared else { return }
+            updateContinuousProgression()
+            resetContinuousInnerScrollPosition()
+            isProgrammaticInnerScrollEnabled = false
         }
 
         switch location {
@@ -274,12 +286,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
             await scroll(toProgression: 0, animated: animated)
         case .end:
             await scroll(toProgression: 1, animated: animated)
-        }
-
-        if wasContinuousPrepared {
-            updateContinuousProgression()
-            resetContinuousInnerScrollPosition()
-            scrollView.isScrollEnabled = false
         }
 
         didCompleteGoTo()
@@ -316,8 +322,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
             resetContinuousInnerScrollPosition()
         }
         isContinuousPrepared = true
-        scrollView.isScrollEnabled = false
+        applyUserPageTurnInteraction()
         return continuousProgression
+    }
+
+    override func applyUserPageTurnInteraction() {
+        scrollView.isScrollEnabled = isProgrammaticInnerScrollEnabled
+            || (isUserPageTurnInteractionEnabled && !viewModel.continuousScroll)
     }
 
     private func continuousProgressionForTagID(_ id: String) async -> Double? {
