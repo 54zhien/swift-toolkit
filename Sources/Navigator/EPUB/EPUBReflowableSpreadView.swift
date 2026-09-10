@@ -273,10 +273,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
         }
 
         defer {
-            guard wasContinuousPrepared else { return }
-            updateContinuousProgression()
-            resetContinuousInnerScrollPosition()
-            isProgrammaticInnerScrollEnabled = false
+            if wasContinuousPrepared {
+                updateContinuousProgression()
+                resetContinuousInnerScrollPosition()
+                isProgrammaticInnerScrollEnabled = false
+            }
         }
 
         switch location {

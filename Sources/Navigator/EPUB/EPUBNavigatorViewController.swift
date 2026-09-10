@@ -1018,13 +1018,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let prewarmEpoch = adjacentPageGeneration
         let prewarmDeadline = adjacentPageDeadline(after: 3_000_000_000)
         defer {
-            guard adjacentPagePrewarmToken == prewarmToken else { return }
-            adjacentPagePrewarmToken = nil
-            if prewarmEpoch == adjacentPageGeneration {
-                for direction in [NavigatorPageDirection.backward, .forward]
-                    where adjacentPageReadiness[direction] == .preparing
-                {
-                    adjacentPageReadiness[direction] = .unknown
+            if adjacentPagePrewarmToken == prewarmToken {
+                adjacentPagePrewarmToken = nil
+                if prewarmEpoch == adjacentPageGeneration {
+                    for direction in [NavigatorPageDirection.backward, .forward]
+                        where adjacentPageReadiness[direction] == .preparing
+                    {
+                        adjacentPageReadiness[direction] = .unknown
+                    }
                 }
             }
         }
