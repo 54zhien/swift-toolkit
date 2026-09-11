@@ -1665,9 +1665,46 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard spreadView.isSpreadReady,
               deadline > DispatchTime.now().uptimeNanoseconds,
               await waitForStablePaint(of: spreadView, deadline: deadline),
+              await waitForPageBoundary(of: spreadView, deadline: deadline),
               !Task.isCancelled
         else { return nil }
         return await snapshot(of: spreadView.webView, deadline: deadline)
+    }
+
+    /// How far off a page boundary a position may be and still be snapshotted,
+    /// as a fraction of one page.
+    private var pageBoundaryAlignmentTolerance: Double { 0.02 }
+
+    /// Waits until the horizontal pagination is resting on a page boundary.
+    ///
+    /// Two painted frames are not enough. The web view is a multi-column
+    /// document, so a scroll offset that is not a whole number of viewports
+    /// captures the tail of one page and the head of the next.
+    ///
+    /// The page script already re-snaps on any body resize — its ResizeObserver
+    /// calls `snapCurrentPosition` — so a reflow does not leave the position
+    /// permanently wrong. The failure is one of timing: the snap lands in a
+    /// `requestAnimationFrame` that can easily run after these two frames, and
+    /// the snapshot then captures the pre-snap position. Waiting for the
+    /// position itself, rather than for a frame count, is what closes that
+    /// window; no corrective navigation is needed.
+    ///
+    /// Returning false fails the snapshot, which is deliberate: a half page must
+    /// never become a page surface. The caller retries on its next prewarm.
+    private func waitForPageBoundary(of spreadView: EPUBSpreadView, deadline: UInt64) async -> Bool {
+        guard spreadView.requiresPageBoundaryAlignment else { return true }
+
+        for _ in 0..<30 {
+            if let residual = spreadView.pageBoundaryResidual,
+               residual <= pageBoundaryAlignmentTolerance {
+                return true
+            }
+            guard !Task.isCancelled else { return false }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return false }
+            try? await Task.sleep(nanoseconds: min(16_000_000, deadline - now))
+        }
+        return false
     }
 
     private func waitForStablePaint(of spreadView: EPUBSpreadView, deadline: UInt64) async -> Bool {
@@ -1914,15 +1951,65 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard let transaction = adjacentPageTransaction,
               transaction.surface === surface else { return }
         let shouldRefreshLocation = !transaction.externalNavigationRequested
+
+        // Roll the cache forward instead of emptying it.
+        //
+        // A surface binds its direction, origin and generation at construction
+        // and is immutable, so none of these can be reused as-is — but the
+        // pixels are only an image of a page, and the pages that survive a turn
+        // are exactly the two already in hand: the one just turned to, and the
+        // one just left. Promoting them means the next prewarm renders only the
+        // one genuinely new page rather than all three.
+        //
+        // This is fail-safe. A promoted surface is only accepted if the
+        // navigator's settled location still matches its locator, so a mismatch
+        // simply falls back to a full prewarm — the behaviour without this.
+        let committed = surface
+        let departed = preparedCurrentPageSurfaceCache
+
         surface.invalidate()
         adjacentPageTransaction = nil
-        for surface in adjacentPageCache.values {
-            surface.invalidate()
+        for cached in adjacentPageCache.values {
+            cached.invalidate()
         }
         adjacentPageCache.removeAll()
         preparedCurrentPageSurfaceCache = nil
+
         adjacentPageGeneration &+= 1
-        adjacentPageReadiness = [.backward: .unknown, .forward: .unknown]
+        let generation = adjacentPageGeneration
+
+        preparedCurrentPageSurfaceCache = NavigatorCurrentPageSurface(
+            image: committed.image,
+            contentRect: committed.geometry.contentRect,
+            identity: NavigatorPagePositionIdentity(
+                locator: committed.locator,
+                generation: generation
+            ),
+            generation: generation
+        )
+
+        // The page we left is now the neighbour on the side we turned away
+        // from. The leaf fields are not carried across: the current-page
+        // surface does not record them, and they only matter for fixed-layout
+        // spreads, which do not take this path.
+        let departedDirection: NavigatorPageDirection =
+            committed.direction == .forward ? .backward : .forward
+        if let departed {
+            adjacentPageCache[departedDirection] = NavigatorPageSurface(
+                direction: departedDirection,
+                locator: departed.identity.locator,
+                image: departed.image,
+                origin: committed.locator,
+                token: UUID(),
+                generation: generation,
+                contentRect: departed.geometry.contentRect
+            )
+            adjacentPageReadiness[departedDirection] = .ready
+            adjacentPageReadiness[departedDirection == .forward ? .backward : .forward] = .unknown
+        } else {
+            adjacentPageReadiness = [.backward: .unknown, .forward: .unknown]
+        }
+
         isPerformingAdjacentPageNavigation = false
         suppressLocationNotifications = false
         if shouldRefreshLocation {

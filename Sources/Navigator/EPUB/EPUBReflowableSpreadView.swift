@@ -511,6 +511,35 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
         progression
     }
 
+    override var requiresPageBoundaryAlignment: Bool { true }
+
+    /// How far the current scroll position sits from a page boundary, as a
+    /// fraction of one page. nil until a progression has been published.
+    ///
+    /// `progression` is `scrollX/scrollWidth ... (scrollX+viewportWidth)/scrollWidth`,
+    /// so `upperBound - lowerBound` is exactly one viewport expressed as a
+    /// fraction of the content, and `lowerBound / span` is the scroll position
+    /// measured in viewports — the page index. Its distance from the nearest
+    /// integer is how far a snapshot would straddle two pages.
+    override var pageBoundaryResidual: Double? {
+        guard let progression else { return nil }
+
+        // The two ends of the content are valid resting places even when a full
+        // viewport cannot scroll there: the clamp leaves the arithmetic off a
+        // boundary, and the viewport is aligned by definition.
+        if progression.upperBound >= 1 - 0.001 || progression.lowerBound <= 0.001 {
+            return 0
+        }
+
+        let span = progression.upperBound - progression.lowerBound
+        guard span > 0, span.isFinite else { return nil }
+
+        let pages = progression.lowerBound / span
+        guard pages.isFinite else { return nil }
+
+        return abs(pages - pages.rounded())
+    }
+
     /// To check if a progression change was cancelled or not.
     private var previousProgression: ClosedRange<Double>?
 

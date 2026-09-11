@@ -135,6 +135,20 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// send navigator callbacks or alter the visible spread.
     var surfaceContentInset: UIEdgeInsets?
 
+    /// Whether a snapshot of this spread can land between two pages.
+    ///
+    /// True for reflowable content, which is laid out as a multi-column
+    /// document: capturing `webView.bounds` while the scroll offset is not a
+    /// whole number of viewports yields the tail of one page and the head of
+    /// the next. Fixed-layout spreads position their page explicitly and have
+    /// no such failure mode.
+    var requiresPageBoundaryAlignment: Bool { false }
+
+    /// How far the current position sits from a page boundary, as a fraction of
+    /// one page. nil when no position has been published yet.
+    /// See `EPUBReflowableSpreadView.pageBoundaryResidual`.
+    var pageBoundaryResidual: Double? { nil }
+
     /// Controls whether this spread may accept the navigator's user page-turn
     /// interaction. Programmatic positioning remains available when this is
     /// false; subclasses may add a short-lived programmatic override.
