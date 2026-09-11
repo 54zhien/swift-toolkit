@@ -614,6 +614,18 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         assert(Thread.isMainThread, "User settings must be updated from the main thread")
     }
 
+    /// Re-reads the content inset supplied by the host geometry.
+    ///
+    /// The inset comes from the delegate, which may derive it from layout the
+    /// spread view does not observe: a host chrome reserved at the top and
+    /// bottom, a container corner configuration, and so on. Those can change
+    /// without moving this view, so `applySettings()` is not enough on its own
+    /// and hosts must ask for a refresh explicitly.
+    /// To override in subclasses.
+    func refreshContentInset() {
+        assert(Thread.isMainThread, "Content insets must be updated from the main thread")
+    }
+
     // MARK: - Location and progression.
 
     /// Current progression in the resource with given href.

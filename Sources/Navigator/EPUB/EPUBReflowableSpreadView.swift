@@ -15,6 +15,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!
 
+    /// Last inset applied to the constraints, so a refresh that resolves to
+    /// the same value does not dirty the layout again.
+    private var appliedContentInset: UIEdgeInsets?
+    /// Whether the last applied inset used the scroll layout, which applies the
+    /// inset differently from the paginated one.
+    private var appliedScrollLayout: Bool?
+
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
     private(set) var continuousContentHeight: CGFloat = 0
@@ -112,8 +119,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView, ContinuousPageView {
         updateContentInset()
     }
 
+    override func refreshContentInset() {
+        updateContentInset()
+    }
+
     private func updateContentInset() {
         let contentInset = surfaceContentInset ?? delegate?.spreadViewContentInset(self) ?? .zero
+        // The inset is applied as constraints when paginated and as the scroll
+        // view's content inset otherwise, so the layout mode is part of what we
+        // have to re-apply on a change, not just the inset value.
+        guard contentInset != appliedContentInset || viewModel.scroll != appliedScrollLayout else {
+            return
+        }
+        appliedContentInset = contentInset
+        appliedScrollLayout = viewModel.scroll
 
         if viewModel.scroll {
             topConstraint.constant = 0

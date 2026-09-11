@@ -2389,6 +2389,22 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         delegate?.navigator(self, presentationDidChange: presentation)
     }
 
+    /// Re-applies the content insets supplied by `navigatorContentInset(_:)`.
+    ///
+    /// Call this when the host's geometry changed but the navigator's own
+    /// bounds did not, for example when a reserved chrome area above or below
+    /// the navigator was resized. Unlike `submitPreferences(_:)` it neither
+    /// rebuilds the settings nor discards the prepared page surfaces.
+    public func refreshContentInsets() {
+        guard let paginationView = paginationView else {
+            return
+        }
+
+        for pageView in paginationView.loadedViews.values {
+            (pageView as? EPUBSpreadView)?.refreshContentInset()
+        }
+    }
+
     public func editor(of preferences: EPUBPreferences) -> EPUBPreferencesEditor {
         viewModel.editor(of: preferences)
     }
